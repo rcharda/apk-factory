@@ -1,0 +1,88 @@
+{
+  "name": "apk-factory-pro",
+  "version": "3.0.0",
+  "description": "Générateur d'APK WebView — Simple & Dev mode",
+  "main": "main.js",
+  "author": "APK Factory",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder --win",
+    "build:portable": "electron-builder --win portable",
+    "build:installer": "electron-builder --win nsis"
+  },
+  "devDependencies": {
+    "electron": "^31.7.7",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "com.apkfactory.pro",
+    "productName": "APK Factory Pro",
+    "directories": {
+      "output": "../dist_electron",
+      "buildResources": "build"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "../server.py",
+        "to": "server.py"
+      },
+      {
+        "from": "../builder.html",
+        "to": "builder.html"
+      },
+      {
+        "from": "../tools",
+        "to": "tools",
+        "filter": ["**/*"]
+      },
+      {
+        "from": "../workspace",
+        "to": "workspace",
+        "filter": ["**/*"]
+      },
+      {
+        "from": "../output",
+        "to": "output",
+        "filter": ["**/*"]
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        },
+        {
+          "target": "portable",
+          "arch": ["x64"]
+        }
+      ],
+      "icon": "../tools/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "APK Factory Pro",
+      "installerHeaderIcon": "../tools/icon.ico",
+      "installerIcon": "../tools/icon.ico",
+      "uninstallerIcon": "../tools/icon.ico",
+      "installerLanguages": ["French"],
+      "language": "1036"
+    },
+    "linux": {
+      "target": ["AppImage", "deb"],
+      "category": "Development"
+    },
+    "mac": {
+      "target": "dmg"
+    }
+  }
+}

@@ -1,0 +1,103 @@
+{
+  "name": "apk-factory-pro",
+  "version": "3.0.0",
+  "description": "APK Factory Pro",
+  "main": "main.js",
+  "author": "APK Factory",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder --win",
+    "build:installer": "electron-builder --win nsis",
+    "build:portable": "electron-builder --win portable"
+  },
+  "devDependencies": {
+    "electron": "^31.7.7",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "com.apkfactory.pro",
+    "productName": "APK Factory Pro",
+    "copyright": "APK Factory Pro",
+    "directories": {
+      "output": "../dist_electron",
+      "buildResources": "build_res"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "../server.py",
+        "to": "server.py"
+      },
+      {
+        "from": "../builder.html",
+        "to": "builder.html"
+      },
+      {
+        "from": "../license.html",
+        "to": "license.html"
+      },
+      {
+        "from": "../license-renderer.js",
+        "to": "license-renderer.js"
+      },
+      {
+        "from": "../tools",
+        "to": "tools",
+        "filter": [
+          "**/*",
+          "!android-sdk/build-tools/34.0.0/renderscript/**"
+        ]
+      },
+      {
+        "from": "../output",
+        "to": "output",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "../workspace",
+        "to": "workspace",
+        "filter": [
+          "*.apk",
+          "*.bat"
+        ]
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "requestedExecutionLevel": "asInvoker",
+      "icon": "../assets/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "APK Factory Pro",
+      "deleteAppDataOnUninstall": false,
+      "installerIcon": "../assets/icon.ico",
+      "installerHeaderIcon": "../assets/icon.ico",
+      "uninstallerIcon": "../assets/icon.ico"
+    },
+    "compression": "normal"
+  }
+}

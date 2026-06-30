@@ -1,0 +1,24 @@
+# Dépendances et builds
+node_modules/
+dist/
+dist_electron/
+electron_app/node_modules/
+electron_app/dist/
+
+# Outils embarqués (trop volumineux pour git, à distribuer séparément)
+tools/
+
+# Fichiers sensibles - NE JAMAIS COMMITER
+ks_pass.txt
+*.jks
+*.keystore
+.env
+
+# Dossiers de travail générés à l'exécution
+output/
+workspace/
+
+# OS / éditeurs
+Thumbs.db
+.DS_Store
+.vscode/
