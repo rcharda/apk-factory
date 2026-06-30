@@ -99,5 +99,8 @@
       "uninstallerIcon": "../assets/icon.ico"
     },
     "compression": "normal"
+  },
+  "dependencies": {
+    "electron-updater": "^6.8.9"
   }
 }
