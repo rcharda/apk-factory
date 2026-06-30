@@ -1,4 +1,5 @@
 const { app, BrowserWindow, shell, dialog, Menu, ipcMain } = require('electron');
+const { autoUpdater } = require('electron-updater');
 const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
@@ -9,6 +10,63 @@ let mainWindow = null;
 let pythonProcess = null;
 let serverReady = false;
 let licensedEmail = null; // rempli une fois la licence validée
+
+// ─── Auto-updater ─────────────────────────────────────────────────────────────
+function setupAutoUpdater() {
+  // Logs visibles dans la console Electron
+  autoUpdater.logger = require('electron-log');
+  autoUpdater.logger.transports.file.level = 'info';
+
+  // Vérifier silencieusement au démarrage (pas de popup intempestif)
+  autoUpdater.autoDownload = true;
+  autoUpdater.autoInstallOnAppQuit = true;
+
+  autoUpdater.on('checking-for-update', () => {
+    console.log('[Updater] Vérification des mises à jour...');
+  });
+
+  autoUpdater.on('update-available', (info) => {
+    console.log(`[Updater] Mise à jour disponible : v${info.version}`);
+    // Notifier l'UI (optionnel)
+    mainWindow?.webContents.send('update-available', { version: info.version });
+  });
+
+  autoUpdater.on('update-not-available', () => {
+    console.log('[Updater] Aucune mise à jour disponible.');
+  });
+
+  autoUpdater.on('download-progress', (progress) => {
+    const pct = Math.round(progress.percent);
+    console.log(`[Updater] Téléchargement : ${pct}%`);
+    mainWindow?.webContents.send('update-progress', { percent: pct });
+  });
+
+  autoUpdater.on('update-downloaded', (info) => {
+    console.log(`[Updater] Mise à jour v${info.version} téléchargée.`);
+    dialog.showMessageBox(mainWindow, {
+      type: 'info',
+      title: 'Mise à jour disponible',
+      message: `APK Factory Pro v${info.version} est prête à être installée.`,
+      detail: 'L\'application va redémarrer pour appliquer la mise à jour.',
+      buttons: ['Redémarrer maintenant', 'Plus tard'],
+      defaultId: 0,
+    }).then(({ response }) => {
+      if (response === 0) autoUpdater.quitAndInstall();
+    });
+  });
+
+  autoUpdater.on('error', (err) => {
+    console.error('[Updater] Erreur :', err.message);
+    // Pas de dialog d'erreur pour ne pas perturber l'utilisateur
+  });
+
+  // Lancer la vérification (uniquement en mode packagé)
+  if (app.isPackaged) {
+    autoUpdater.checkForUpdates().catch((err) => {
+      console.error('[Updater] checkForUpdates échoué :', err.message);
+    });
+  }
+}
 
 // ─── Trouver Python ───────────────────────────────────────────────────────────
 function findPython() {
@@ -94,8 +152,8 @@ function waitForServer(resolve, reject, attempts) {
 // ─── Créer la fenêtre principale ──────────────────────────────────────────────
 function createWindow() {
   const iconPath = app.isPackaged
-    ? path.join(process.resourcesPath, 'tools', 'icon.ico')
-    : path.join(__dirname, '..', 'tools', 'icon.ico');
+    ? path.join(process.resourcesPath, 'assets', 'icon.ico')
+    : path.join(__dirname, '..', 'assets', 'icon.ico');
 
   mainWindow = new BrowserWindow({
     width: 1280,
@@ -127,6 +185,22 @@ function createWindow() {
         {
           label: 'Ouvrir dans le navigateur',
           click: () => shell.openExternal(`http://localhost:${PORT}`),
+        },
+        { type: 'separator' },
+        {
+          label: 'Vérifier les mises à jour',
+          click: () => {
+            if (app.isPackaged) {
+              autoUpdater.checkForUpdates().catch((err) => {
+                dialog.showErrorBox('Mise à jour', `Erreur : ${err.message}`);
+              });
+            } else {
+              dialog.showMessageBox(mainWindow, {
+                type: 'info',
+                message: 'Mises à jour uniquement disponibles en version packagée.',
+              });
+            }
+          },
         },
         { type: 'separator' },
         { role: 'quit', label: 'Quitter' },
@@ -217,6 +291,17 @@ ipcMain.on('open-external', (event, url) => {
 // ─── IPC : version de l'app ────────────────────────────────────────────────────
 ipcMain.handle('get-version', () => app.getVersion());
 
+// ─── IPC : forcer une vérification de mise à jour depuis le renderer ───────────
+ipcMain.handle('check-for-updates', async () => {
+  if (!app.isPackaged) return { status: 'dev-mode' };
+  try {
+    await autoUpdater.checkForUpdates();
+    return { status: 'checking' };
+  } catch (err) {
+    return { status: 'error', message: err.message };
+  }
+});
+
 function waitForServerReady() {
   return new Promise((resolve, reject) => {
     if (serverReady) {
@@ -240,6 +325,9 @@ function waitForServerReady() {
 app.whenReady().then(async () => {
   // Afficher l'écran de licence immédiatement
   createWindow();
+
+  // Initialiser l'auto-updater après création de la fenêtre
+  setupAutoUpdater();
 
   // Démarrer le serveur Python en arrière-plan, sans bloquer l'UI de licence
   startPythonServer().catch((err) => {

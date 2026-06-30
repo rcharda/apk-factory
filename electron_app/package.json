@@ -98,9 +98,15 @@
       "installerHeaderIcon": "../assets/icon.ico",
       "uninstallerIcon": "../assets/icon.ico"
     },
-    "compression": "normal"
+    "compression": "normal",
+    "publish": {
+      "provider": "github",
+      "owner": "rcharda",
+      "repo": "apk-factory"
+    }
   },
   "dependencies": {
+    "electron-log": "^5.4.4",
     "electron-updater": "^6.8.9"
   }
 }
