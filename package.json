@@ -39,28 +39,38 @@
       {
         "from": "../tools",
         "to": "tools",
-        "filter": ["**/*"]
+        "filter": [
+          "**/*"
+        ]
       },
       {
         "from": "../workspace",
         "to": "workspace",
-        "filter": ["**/*"]
+        "filter": [
+          "**/*"
+        ]
       },
       {
         "from": "../output",
         "to": "output",
-        "filter": ["**/*"]
+        "filter": [
+          "**/*"
+        ]
       }
     ],
     "win": {
       "target": [
         {
           "target": "nsis",
-          "arch": ["x64"]
+          "arch": [
+            "x64"
+          ]
         },
         {
           "target": "portable",
-          "arch": ["x64"]
+          "arch": [
+            "x64"
+          ]
         }
       ],
       "icon": "../tools/icon.ico"
@@ -74,15 +84,24 @@
       "installerHeaderIcon": "../tools/icon.ico",
       "installerIcon": "../tools/icon.ico",
       "uninstallerIcon": "../tools/icon.ico",
-      "installerLanguages": ["French"],
+      "installerLanguages": [
+        "French"
+      ],
       "language": "1036"
     },
     "linux": {
-      "target": ["AppImage", "deb"],
+      "target": [
+        "AppImage",
+        "deb"
+      ],
       "category": "Development"
     },
     "mac": {
       "target": "dmg"
     }
+  },
+  "dependencies": {
+    "electron-log": "^5.4.4",
+    "electron-updater": "^6.8.9"
   }
 }

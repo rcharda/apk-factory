@@ -506,6 +506,79 @@
   .session-del { background: none; border: none; cursor: pointer; color: var(--muted); font-size: 11px; padding: 2px 4px; }
   .session-del:hover { color: var(--red); }
 
+  /* ── Content search (recherche dans le contenu de tous les fichiers) ── */
+  #content-search-wrap {
+    padding: 0 8px 6px;
+    flex-shrink: 0;
+    border-bottom: 1px solid var(--border-soft);
+  }
+  #content-search-toggle {
+    width: 100%;
+    background: var(--panel3);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--muted);
+    font-size: 11px;
+    padding: 6px 8px;
+    cursor: pointer;
+    text-align: left;
+  }
+  #content-search-toggle:hover { color: var(--text); border-color: var(--accent2); }
+  #content-search-panel { margin-top: 6px; }
+  #content-search-row { display: flex; gap: 6px; }
+  #content-search-input {
+    flex: 1;
+    background: var(--panel3);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 11px;
+    padding: 5px 8px;
+    outline: none;
+  }
+  #content-search-input:focus { border-color: var(--accent2); }
+  #content-search-opts {
+    display: flex; align-items: center; gap: 10px;
+    font-size: 10px; color: var(--muted); margin: 5px 2px;
+  }
+  #content-search-opts label { display: flex; align-items: center; gap: 3px; cursor: pointer; }
+  #content-search-results { max-height: 260px; overflow-y: auto; }
+  .csr-item {
+    padding: 5px 8px; border-radius: 5px; cursor: pointer;
+    font-size: 10.5px; margin-bottom: 2px;
+  }
+  .csr-item:hover { background: var(--panel3); }
+  .csr-path { color: var(--accent2); font-family: var(--mono); }
+  .csr-line { color: var(--muted); }
+  .csr-snippet {
+    font-family: var(--mono); color: var(--text); white-space: pre;
+    overflow-x: hidden; text-overflow: ellipsis; display: block; margin-top: 2px;
+  }
+
+  /* ── Smali Facile (édition guidée) ── */
+  .chip {
+    background: var(--panel3); border: 1px solid var(--border);
+    color: var(--muted); border-radius: 14px; padding: 4px 10px;
+    font-size: 10.5px; cursor: pointer;
+  }
+  .chip.active { background: var(--accent2); color: #fff; border-color: var(--accent2); }
+  .smali-fact {
+    background: var(--panel3); border: 1px solid var(--border);
+    border-radius: 8px; padding: 8px 10px; margin-bottom: 8px;
+  }
+  .smali-fact-head {
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 10px; color: var(--muted); margin-bottom: 6px;
+  }
+  .smali-fact-loc { font-family: var(--mono); }
+  .smali-fact-row { display: flex; gap: 6px; align-items: center; }
+  .smali-fact-row input[type=text], .smali-fact-row input[type=color], .smali-fact-row input[type=number] {
+    flex: 1; background: var(--panel); border: 1px solid var(--border);
+    border-radius: 6px; color: var(--text); font-size: 12px; padding: 5px 7px;
+  }
+  .smali-fact-empty { font-size: 11px; color: var(--muted); padding: 10px 2px; }
+
   /* ── Sessions toolbar (select-all + delete selected) ── */
   #sessions-toolbar {
     display: flex; align-items: center; gap: 6px;
@@ -559,6 +632,7 @@
     font-size: 11px; padding: 4px 10px;
   }
   .editor-btn:hover { border-color: var(--accent2); color: var(--accent2); }
+  .editor-btn.active { border-color: var(--accent2); color: var(--accent2); background: #ffffff0f; }
   .editor-btn.save { border-color: var(--green); color: var(--green); }
   .editor-btn.save:hover { background: #3ddc8415; }
   .editor-btn.danger:hover { border-color: var(--red); color: var(--red); }
@@ -822,30 +896,6 @@
   }
   .img-picker-cell.selected .img-check { display: flex; }
 
-  /* ── Context menu pour la grille d'images ── */
-  #img-ctx-menu {
-    display: none; position: fixed; z-index: 9000;
-    background: var(--panel); border: 1px solid var(--border);
-    border-radius: 8px; padding: 4px;
-    min-width: 200px;
-    box-shadow: 0 8px 32px #000c;
-    font-size: 12px;
-  }
-  #img-ctx-menu.show { display: block; }
-  .img-ctx-title {
-    display: flex; align-items: center; justify-content: space-between; gap: 8px;
-    padding: 5px 6px 5px 10px; font-size: 10px; font-family: var(--mono);
-    color: var(--muted); border-bottom: 1px solid var(--border); margin-bottom: 4px;
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  }
-  .img-ctx-item {
-    display: flex; align-items: center; gap: 8px;
-    padding: 7px 10px; border-radius: 5px; cursor: pointer;
-  }
-  .img-ctx-item:hover { background: var(--panel3); }
-  .img-ctx-item.danger { color: var(--red); }
-  .img-ctx-item.highlight { color: var(--accent2); }
-  .img-ctx-sep { height: 1px; background: var(--border); margin: 4px 0; }
   /* Hint clic droit visible au survol */
   .img-picker-cell::after {
     content: '↗ Options';
@@ -892,6 +942,8 @@
     border-radius: 8px;
     padding: 4px;
     min-width: 200px;
+    max-height: calc(100vh - 16px);
+    overflow-y: auto;
     box-shadow: 0 8px 32px #000c;
     font-size: 12px;
     animation: ctxFade .1s ease;
@@ -905,6 +957,12 @@
     gap: 6px;
   }
   .img-ctx-title span { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .img-ctx-close {
+    background: none; border: none; cursor: pointer;
+    color: var(--muted); font-size: 13px; line-height: 1;
+    padding: 3px 6px; border-radius: 4px; flex-shrink: 0;
+  }
+  .img-ctx-close:hover { color: var(--red); background: var(--panel3); }
   .img-ctx-item {
     display: flex; align-items: center; gap: 8px;
     padding: 6px 10px; border-radius: 5px; cursor: pointer;
@@ -1083,7 +1141,45 @@
   #device-test-result.err { background:#2a0a0a; border:1px solid var(--red); color:var(--red); }
   #device-test-result.run { background:#1a1a2a; border:1px solid var(--orange); color:var(--orange); }
 
-  /* ── DEVICE SELECT MODAL ── */
+  /* ============ RENAME MODAL ============ */
+  #rename-modal-overlay {
+    display: none;
+    position: fixed; inset: 0;
+    background: #00000099;
+    z-index: 9500;
+    align-items: center;
+    justify-content: center;
+  }
+  #rename-modal-overlay.show { display: flex; }
+  #rename-modal {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 22px;
+    width: 420px;
+    max-width: 92vw;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    box-shadow: 0 24px 80px #000c;
+  }
+  .rename-modal-title {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 15px; font-weight: 700;
+  }
+  .rename-modal-old {
+    font-size: 11px; font-family: var(--mono); color: var(--muted);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .rename-modal-actions { display: flex; gap: 10px; }
+  .rename-modal-actions .btn-primary { flex: 1; }
+  .rename-modal-actions .btn-secondary { width: auto; padding: 10px 18px; }
+  #rename-modal-error {
+    display: none; color: var(--red); font-size: 12px; font-family: var(--mono);
+    padding: 6px 10px; background: #2a0a0a; border-radius: 5px; border: 1px solid #5a1a1a;
+  }
+
+
   #device-modal-overlay { display:none; position:fixed; inset:0; background:#000a; z-index:4000; align-items:center; justify-content:center; }
   #device-modal-overlay.show { display:flex; }
   #device-modal { background:var(--panel2); border:1px solid var(--border); border-radius:12px; padding:20px; min-width:320px; max-width:480px; }
@@ -1224,6 +1320,28 @@
       <div id="tree-search-results"></div>
     </div>
 
+    <!-- Recherche dans le CONTENU de tous les fichiers (control total : tout texte
+         écrit dans n'importe quel fichier du projet, smali/xml/json/etc.) -->
+    <div id="content-search-wrap">
+      <button id="content-search-toggle" onclick="toggleContentSearch()" title="Rechercher un texte dans le contenu de tous les fichiers">
+        🔎 Recherche dans le contenu
+      </button>
+      <div id="content-search-panel" style="display:none">
+        <div id="content-search-row">
+          <input id="content-search-input" type="text" placeholder="Texte à chercher dans tous les fichiers…"
+            oninput="onContentSearchInput(this.value)"
+            onkeydown="if(event.key==='Enter') runContentSearch()" autocomplete="off" spellcheck="false">
+          <button class="editor-btn save" onclick="runContentSearch()">Chercher</button>
+        </div>
+        <div id="content-search-opts">
+          <label><input type="checkbox" id="content-search-regex"> Regex</label>
+          <label><input type="checkbox" id="content-search-case"> Casse</label>
+          <span id="content-search-status"></span>
+        </div>
+        <div id="content-search-results"></div>
+      </div>
+    </div>
+
     <div id="tree-container">
       <div class="tree-empty" id="tree-empty">
         Aucun projet chargé.<br><br>
@@ -1262,6 +1380,28 @@
         <div style="font-size:11px;color:var(--muted)">ou crée / importe un projet pour commencer</div>
       </div>
       <textarea id="code-editor" style="display:none" spellcheck="false"></textarea>
+      <div id="binary-editor-wrap" style="display:none; flex-direction:column; width:100%; height:100%; box-sizing:border-box;">
+        <div id="binary-tabs" style="display:none; gap:6px; padding:8px 12px 0 12px;">
+          <button class="editor-btn" id="tab-btn-axml" onclick="switchBinaryTab('axml')">🔤 Chaînes (sûr)</button>
+          <button class="editor-btn" id="tab-btn-hex" onclick="switchBinaryTab('hex')">🔧 Hex (avancé)</button>
+        </div>
+        <div id="hex-editor-wrap" style="display:none; flex-direction:column; flex:1; min-height:0;">
+          <div id="hex-editor-info" style="padding:8px 12px; font-size:11px; color:var(--muted); border-bottom:1px solid var(--border, #333); display:flex; gap:14px; align-items:center; flex-wrap:wrap;">
+            <span>🔧 Édition hexadécimale (octets bruts) — risque de corruption si la structure est cassée</span>
+            <span id="hex-editor-size"></span>
+            <span id="hex-editor-warn" style="color:#e0a030;"></span>
+          </div>
+          <textarea id="hex-editor" style="display:block; flex:1; font-family:'Cascadia Code','Consolas',monospace; font-size:12px; letter-spacing:1px; white-space:pre-wrap; resize:none; width:100%; box-sizing:border-box;" spellcheck="false"></textarea>
+        </div>
+        <div id="axml-editor-wrap" style="display:none; flex-direction:column; flex:1; min-height:0;">
+          <div id="axml-editor-info" style="padding:8px 12px; font-size:11px; color:var(--muted); border-bottom:1px solid var(--border, #333);">
+            🔤 XML binaire compilé détecté — édite uniquement le texte des chaînes ci-dessous.
+            Le nombre de chaînes est verrouillé (<span id="axml-string-count"></span>) pour garantir qu'aucun index
+            référencé dans l'arbre XML ne soit décalé : zéro risque de corruption.
+          </div>
+          <div id="axml-string-list" style="flex:1; min-height:0; overflow-y:auto; padding:10px 12px;"></div>
+        </div>
+      </div>
       <div id="img-preview-wrap" onclick="triggerImageReplace()">
         <img id="img-preview">
         <div id="img-replace-overlay">
@@ -1290,6 +1430,7 @@
       <button class="cfg-tab" data-tab="perms" onclick="setCfgTab('perms')">Permissions</button>
       <button class="cfg-tab" data-tab="assets" onclick="setCfgTab('assets')">Assets</button>
       <button class="cfg-tab" data-tab="manifest" onclick="setCfgTab('manifest')">Manifest+</button>
+      <button class="cfg-tab" data-tab="smalifacile" onclick="setCfgTab('smalifacile')">🧩 Smali Facile</button>
     </div>
 
     <!-- IDENTITY -->
@@ -1502,6 +1643,31 @@
       <button class="btn-mini" onclick="applyChanges()">⚙ Injecter dans le manifest</button>
     </div>
 
+    <!-- SMALI FACILE : interface guidée pour modifier couleurs, textes, durées
+         et URLs codées en dur dans le smali, sans connaître la syntaxe smali. -->
+    <div class="cfg-section" data-section="smalifacile">
+      <div class="field-group">
+        <label>Modifier des valeurs courantes du smali</label>
+        <div class="field-hint">
+          Scanne tous les fichiers <code>.smali</code> du projet et détecte automatiquement
+          les couleurs, textes, durées d'animation et URLs codées en dur. Modifie-les ici
+          sans avoir à comprendre la syntaxe smali.
+        </div>
+        <button class="btn-mini" id="smali-scan-btn" onclick="scanSmaliFacts()">🔎 Scanner le projet</button>
+        <span id="smali-scan-status" style="font-size:11px;color:var(--muted);margin-left:8px"></span>
+      </div>
+      <div class="divider"></div>
+      <div id="smali-facts-filters" style="display:none;gap:6px;flex-wrap:wrap;margin-bottom:8px">
+        <button class="chip active" data-ftype="all" onclick="setSmaliFilter('all')">Tout</button>
+        <button class="chip" data-ftype="color" onclick="setSmaliFilter('color')">🎨 Couleurs</button>
+        <button class="chip" data-ftype="color_int" onclick="setSmaliFilter('color_int')">🎨 Couleurs (ARGB)</button>
+        <button class="chip" data-ftype="text" onclick="setSmaliFilter('text')">📝 Textes</button>
+        <button class="chip" data-ftype="duration" onclick="setSmaliFilter('duration')">⏱ Durées</button>
+        <button class="chip" data-ftype="url" onclick="setSmaliFilter('url')">🔗 URLs</button>
+      </div>
+      <div id="smali-facts-list"></div>
+    </div>
+
     <!-- ACTIONS -->
     <div id="action-bar">
       <div id="action-bar-row">
@@ -1516,6 +1682,20 @@
     </div>
   </div>
 
+</div>
+
+<!-- RENAME MODAL -->
+<div id="rename-modal-overlay">
+  <div id="rename-modal">
+    <div class="rename-modal-title">✏️ Renommer</div>
+    <div class="rename-modal-old" id="rename-modal-old"></div>
+    <input type="text" id="rename-modal-input" placeholder="Nouveau nom" autocomplete="off" spellcheck="false">
+    <div id="rename-modal-error"></div>
+    <div class="rename-modal-actions">
+      <button class="btn-secondary" onclick="closeRenameModal()">Annuler</button>
+      <button class="btn-primary" id="rename-modal-confirm" onclick="confirmRenameModal()">✏️ Renommer</button>
+    </div>
+  </div>
 </div>
 
 <!-- DEVICE SELECT MODAL -->
@@ -1828,6 +2008,68 @@ function toast(msg, kind) {
   clearTimeout(el._t);
   el._t = setTimeout(() => el.classList.remove('show'), 2800);
 }
+
+/* ===================================================================
+   RENAME MODAL (remplace window.prompt — utilisé par le menu de
+   l'arborescence ET par le menu de la grille d'images)
+=================================================================== */
+let _renameModalCallback = null;
+
+function openRenameModal(oldName, onConfirm) {
+  _renameModalCallback = onConfirm;
+  const overlay = document.getElementById('rename-modal-overlay');
+  const input   = document.getElementById('rename-modal-input');
+  const errBox  = document.getElementById('rename-modal-error');
+  document.getElementById('rename-modal-old').textContent = 'Fichier actuel : ' + oldName;
+  errBox.style.display = 'none';
+  errBox.textContent = '';
+  input.value = oldName;
+  overlay.classList.add('show');
+  setTimeout(() => {
+    input.focus();
+    const dot = oldName.lastIndexOf('.');
+    if (dot > 0) input.setSelectionRange(0, dot);
+    else input.select();
+  }, 10);
+}
+
+function closeRenameModal() {
+  document.getElementById('rename-modal-overlay').classList.remove('show');
+  _renameModalCallback = null;
+}
+
+function renameModalError(msg) {
+  const errBox = document.getElementById('rename-modal-error');
+  errBox.textContent = msg;
+  errBox.style.display = 'block';
+}
+
+async function confirmRenameModal() {
+  const input = document.getElementById('rename-modal-input');
+  const newName = input.value.trim();
+  if (!newName) { renameModalError('Le nom ne peut pas être vide.'); return; }
+  if (/[\\/:*?"<>|]/.test(newName)) { renameModalError('Caractère interdit dans un nom de fichier.'); return; }
+  const cb = _renameModalCallback;
+  if (!cb) { closeRenameModal(); return; }
+  const btn = document.getElementById('rename-modal-confirm');
+  btn.disabled = true;
+  try {
+    await cb(newName);
+    closeRenameModal();
+  } catch (e) {
+    renameModalError(e && e.message ? e.message : 'Erreur lors du renommage.');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+document.getElementById('rename-modal-input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); confirmRenameModal(); }
+  else if (e.key === 'Escape') { e.preventDefault(); closeRenameModal(); }
+});
+document.getElementById('rename-modal-overlay').addEventListener('click', (e) => {
+  if (e.target.id === 'rename-modal-overlay') closeRenameModal();
+});
 
 /* ===================================================================
    TOP MODE SWITCH (Scratch / Template)
@@ -2643,13 +2885,14 @@ async function openFile(path) {
     const data = await r.json();
     if (data.error) { toast(data.error, 'err'); return; }
 
-    currentFile = { path, type: data.type, dirty: false };
+    currentFile = { path, type: data.type, dirty: false, binaryTab: null };
     document.getElementById('editor-empty').style.display = 'none';
     document.getElementById('editor-path').innerHTML =
       '<span class="seg-muted">/</span>' + esc(path).replace(/\//g, '<span class="seg-muted">/</span>');
 
     if (data.type === 'text') {
       document.getElementById('code-editor').style.display = 'block';
+      document.getElementById('binary-editor-wrap').style.display = 'none';
       document.getElementById('img-preview-wrap').style.display = 'none';
       const ta = document.getElementById('code-editor');
       ta.value = data.content;
@@ -2658,24 +2901,181 @@ async function openFile(path) {
       document.getElementById('btn-delete-file').style.display = 'inline-block';
     } else if (data.type === 'image') {
       document.getElementById('code-editor').style.display = 'none';
+      document.getElementById('binary-editor-wrap').style.display = 'none';
       document.getElementById('img-preview-wrap').style.display = 'flex';
       document.getElementById('img-preview').src = `data:${data.mime || 'image/png'};base64,` + data.content;
       document.getElementById('btn-save-file').style.display = 'none';
       document.getElementById('btn-delete-file').style.display = 'inline-block';
     } else {
-      document.getElementById('code-editor').style.display = 'block';
+      // type === 'binary' : éditeur de string pool AXML (sûr) et/ou hex (avancé)
+      document.getElementById('code-editor').style.display = 'none';
       document.getElementById('img-preview-wrap').style.display = 'none';
-      document.getElementById('code-editor').value =
-        `(fichier binaire — ${data.size} octets — non éditable en texte)`;
-      document.getElementById('code-editor').oninput = null;
-      document.getElementById('btn-save-file').style.display = 'none';
+      document.getElementById('binary-editor-wrap').style.display = 'flex';
       document.getElementById('btn-delete-file').style.display = 'inline-block';
+
+      currentFile.hexEditable = !!data.hexEditable;
+      currentFile.axml = !!data.axml;
+      currentFile.axmlStringCount = data.axml ? data.axmlStrings.length : 0;
+
+      const tabs = document.getElementById('binary-tabs');
+      tabs.style.display = (data.axml && data.hexEditable) ? 'flex' : 'none';
+
+      if (data.hexEditable && data.content) {
+        const bytes = base64ToBytes(data.content);
+        currentFile.byteLength = bytes.length;
+        document.getElementById('hex-editor-size').textContent = `${bytes.length} octets`;
+        document.getElementById('hex-editor-warn').textContent =
+          'Format : paires hexadécimales séparées par des espaces. Risque de corruption si tu changes la taille ou la structure.';
+        const hex = document.getElementById('hex-editor');
+        hex.value = bytesToHexString(bytes);
+        hex.oninput = () => { currentFile.dirty = true; };
+      } else {
+        document.getElementById('hex-editor-size').textContent = `${data.size} octets`;
+        document.getElementById('hex-editor-warn').textContent =
+          'Fichier trop volumineux pour l\'édition dans le navigateur (> 1.5 Mo). Utilise /file-raw pour le télécharger, modifie-le en externe, puis réimporte-le via "Remplacer par un fichier local".';
+        document.getElementById('hex-editor').value = '';
+        document.getElementById('hex-editor').oninput = null;
+      }
+
+      if (data.axml) {
+        currentFile.axmlUtf8 = data.axmlUtf8;
+        document.getElementById('axml-string-count').textContent = data.axmlStrings.length + ' chaînes';
+        renderAxmlStringList(data.axmlStrings);
+      }
+
+      // Choix de l'onglet par défaut : Chaînes si AXML détecté (sûr), sinon Hex direct
+      switchBinaryTab(data.axml ? 'axml' : 'hex');
+      document.getElementById('btn-save-file').style.display =
+        (data.hexEditable || data.axml) ? 'inline-block' : 'none';
     }
   } catch(e) { toast('Erreur lecture fichier', 'err'); }
 }
 
+function switchBinaryTab(tab) {
+  if (!currentFile) return;
+  // Si le fichier n'est pas un AXML, on force le mode hex (pas d'onglet chaînes possible)
+  if (tab === 'axml' && !currentFile.axml) tab = 'hex';
+  currentFile.binaryTab = tab;
+  document.getElementById('hex-editor-wrap').style.display = (tab === 'hex') ? 'flex' : 'none';
+  document.getElementById('axml-editor-wrap').style.display = (tab === 'axml') ? 'flex' : 'none';
+  const btnAxml = document.getElementById('tab-btn-axml');
+  const btnHex = document.getElementById('tab-btn-hex');
+  if (btnAxml) btnAxml.classList.toggle('active', tab === 'axml');
+  if (btnHex) btnHex.classList.toggle('active', tab === 'hex');
+}
+
+function renderAxmlStringList(strings) {
+  const list = document.getElementById('axml-string-list');
+  list.innerHTML = '';
+  strings.forEach((s, i) => {
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex; gap:8px; align-items:flex-start; padding:4px 0; border-bottom:1px solid #ffffff0d;';
+    const idx = document.createElement('span');
+    idx.textContent = '#' + i;
+    idx.style.cssText = 'flex:0 0 44px; color:var(--muted); font-size:11px; padding-top:6px; font-family:monospace;';
+    const input = document.createElement('textarea');
+    input.value = s;
+    input.rows = 1;
+    input.spellcheck = false;
+    input.dataset.idx = i;
+    input.style.cssText = 'flex:1; resize:vertical; min-height:28px; background:var(--bg2, #1a1a1a); color:var(--text); border:1px solid #ffffff14; border-radius:4px; padding:5px 8px; font-family:var(--mono); font-size:12.5px;';
+    input.oninput = () => { currentFile.dirty = true; };
+    row.appendChild(idx);
+    row.appendChild(input);
+    list.appendChild(row);
+  });
+}
+
+// ── Conversion base64 <-> octets (chunkée pour gros fichiers) ──────────────
+function base64ToBytes(b64) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+function bytesToBase64(bytes) {
+  let bin = '';
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(bin);
+}
+function bytesToHexString(bytes) {
+  const out = new Array(bytes.length);
+  for (let i = 0; i < bytes.length; i++) {
+    out[i] = bytes[i].toString(16).padStart(2, '0');
+  }
+  // 16 octets par ligne pour la lisibilité
+  let result = '';
+  for (let i = 0; i < out.length; i += 16) {
+    result += out.slice(i, i + 16).join(' ') + '\n';
+  }
+  return result.trim();
+}
+function hexStringToBytes(str) {
+  const clean = str.replace(/[^0-9a-fA-F]/g, '');
+  if (clean.length % 2 !== 0) throw new Error('Nombre de caractères hexadécimaux impair — vérifie qu\'aucun octet n\'est incomplet.');
+  const bytes = new Uint8Array(clean.length / 2);
+  for (let i = 0; i < clean.length; i += 2) {
+    bytes[i / 2] = parseInt(clean.substr(i, 2), 16);
+  }
+  return bytes;
+}
+
+async function saveCurrentFileBinary() {
+  if (!currentFile) return;
+  let bytes;
+  try {
+    bytes = hexStringToBytes(document.getElementById('hex-editor').value);
+  } catch (e) {
+    toast(e.message, 'err');
+    return;
+  }
+  try {
+    const r = await fetch('/save-file-binary', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: currentFile.path, data: bytesToBase64(bytes) })
+    });
+    const data = await r.json();
+    if (data.error) { toast(data.error, 'err'); return; }
+    currentFile.dirty = false;
+    document.getElementById('hex-editor-size').textContent = `${data.size} octets`;
+    toast('💾 Fichier binaire enregistré (hex): ' + currentFile.path, 'ok');
+  } catch(e) { toast('Erreur enregistrement binaire', 'err'); }
+}
+
+async function saveCurrentFileAxmlStrings() {
+  if (!currentFile) return;
+  const inputs = document.querySelectorAll('#axml-string-list textarea');
+  const strings = Array.from(inputs).map(el => el.value);
+  if (strings.length !== currentFile.axmlStringCount) {
+    toast('Nombre de chaînes incohérent — ne pas ajouter/supprimer de ligne.', 'err');
+    return;
+  }
+  try {
+    const r = await fetch('/axml-strings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: currentFile.path, strings })
+    });
+    const data = await r.json();
+    if (data.error) { toast(data.error, 'err'); return; }
+    currentFile.dirty = false;
+    toast(`💾 String pool enregistré (${data.stringCount} chaînes, ${data.size} octets) — structure intacte`, 'ok');
+    // Recharge le fichier pour resynchroniser hex/taille
+    openFile(currentFile.path);
+  } catch(e) { toast('Erreur enregistrement string pool', 'err'); }
+}
+
 async function saveCurrentFile() {
   if (!currentFile) return;
+  if (currentFile.type === 'binary') {
+    if (currentFile.binaryTab === 'axml') { await saveCurrentFileAxmlStrings(); }
+    else { await saveCurrentFileBinary(); }
+    return;
+  }
   const content = document.getElementById('code-editor').value;
   try {
     const r = await fetch('/save-file', {
@@ -2698,8 +3098,10 @@ async function deleteCurrentFile() {
     const data = await r.json();
     if (data.error) { toast(data.error, 'err'); return; }
     toast('Supprimé: ' + currentFile.path, 'ok');
+    const deletedPath = currentFile.path;
     closeEditor();
-    loadTree();
+    await loadTree();
+    removeFromSearchResultsAfterDelete(deletedPath);
   } catch(e) { toast('Erreur suppression', 'err'); }
 }
 
@@ -2707,6 +3109,7 @@ function closeEditor() {
   currentFile = null;
   document.getElementById('editor-empty').style.display = 'flex';
   document.getElementById('code-editor').style.display = 'none';
+  document.getElementById('binary-editor-wrap').style.display = 'none';
   document.getElementById('img-preview-wrap').style.display = 'none';
   document.getElementById('editor-path').textContent = 'Aucun fichier ouvert';
   document.getElementById('btn-save-file').style.display = 'none';
@@ -2753,7 +3156,218 @@ function setCfgTab(tab) {
     document.getElementById('splash-picker').style.display = 'none';
     document.getElementById('splash-no-session').style.display = 'block';
   }
+  if (tab === 'smalifacile' && _smaliFacts.length === 0) {
+    scanSmaliFacts();
+  }
 }
+
+// ─── Recherche dans le CONTENU de tous les fichiers (control total) ─────────
+let _contentSearchResults = [];
+let _contentSearchQuery = '';
+
+function toggleContentSearch() {
+  const panel = document.getElementById('content-search-panel');
+  const show = panel.style.display === 'none';
+  panel.style.display = show ? 'block' : 'none';
+  if (show) document.getElementById('content-search-input').focus();
+}
+
+// Quand l'utilisateur efface le texte de la barre de recherche, on remet tout
+// "à sa place" : les résultats disparaissent et l'état redevient celui d'avant
+// toute recherche (pas de résidu affiché).
+function onContentSearchInput(value) {
+  if (!value.trim()) {
+    _contentSearchResults = [];
+    _contentSearchQuery = '';
+    document.getElementById('content-search-results').innerHTML = '';
+    document.getElementById('content-search-status').textContent = '';
+  }
+}
+
+async function runContentSearch() {
+  const q = document.getElementById('content-search-input').value.trim();
+  const status = document.getElementById('content-search-status');
+  const results = document.getElementById('content-search-results');
+  if (!q) { results.innerHTML = ''; status.textContent = ''; _contentSearchResults = []; _contentSearchQuery = ''; return; }
+  if (!window._currentSessionId) {
+    status.textContent = 'Aucun projet chargé.'; results.innerHTML = ''; return;
+  }
+  const regex = document.getElementById('content-search-regex').checked ? '1' : '0';
+  const caseS = document.getElementById('content-search-case').checked ? '1' : '0';
+  status.textContent = 'Recherche…';
+  try {
+    const r = await fetch(`/search-content?session=${encodeURIComponent(window._currentSessionId)}` +
+      `&q=${encodeURIComponent(q)}&regex=${regex}&case=${caseS}`);
+    const data = await r.json();
+    if (data.error) { status.textContent = data.error; results.innerHTML = ''; return; }
+    _contentSearchQuery = q;
+    _contentSearchResults = data.results || [];
+    renderContentSearchResults(data.truncated, data.filesScanned);
+  } catch (e) {
+    status.textContent = 'Erreur de recherche.';
+  }
+}
+
+function renderContentSearchResults(truncated, filesScanned) {
+  const status = document.getElementById('content-search-status');
+  const results = document.getElementById('content-search-results');
+  const items = _contentSearchResults;
+  status.textContent = items.length
+    ? `${items.length} résultat(s)${truncated ? ' (tronqué)' : ''}${filesScanned != null ? ' · ' + filesScanned + ' fichier(s) scanné(s)' : ''}`
+    : 'Aucun résultat.';
+  results.innerHTML = items.map(it => `
+    <div class="csr-item" data-path="${esc(it.path)}" onclick="openFileAtLine('${esc(it.path)}', ${it.line})">
+      <span class="csr-path">${esc(it.path)}</span> <span class="csr-line">:${it.line}</span>
+      <span class="csr-snippet">${esc(it.text)}</span>
+    </div>`).join('') || '<div class="smali-fact-empty">Aucun résultat.</div>';
+}
+
+// Appelé après suppression d'un fichier (depuis n'importe quel point d'entrée :
+// bouton "Supprimer" de l'éditeur ou menu contextuel) pour que les résultats
+// de recherche déjà affichés ne gardent pas une référence à un fichier qui
+// n'existe plus.
+function removeFromSearchResultsAfterDelete(deletedPath) {
+  // Recherche "contenu" : on retire toute ligne provenant du fichier supprimé
+  // (ou de tout fichier sous ce chemin, si un dossier a été supprimé).
+  const before = _contentSearchResults.length;
+  _contentSearchResults = _contentSearchResults.filter(
+    it => it.path !== deletedPath && !it.path.startsWith(deletedPath + '/')
+  );
+  if (_contentSearchResults.length !== before) {
+    renderContentSearchResults(false, null);
+  }
+  // Recherche "fichier/dossier" (dropdown) : recalculée à partir de
+  // _treeAllItems (mis à jour par loadTree), donc on relance simplement la
+  // même requête si la barre contient encore du texte.
+  const treeInput = document.getElementById('tree-search-input');
+  if (treeInput && treeInput.value.trim()) {
+    onTreeSearch(treeInput.value);
+  }
+  // Smali Facile : retire aussi les valeurs détectées dans le fichier supprimé.
+  if (_smaliFacts.length) {
+    const beforeF = _smaliFacts.length;
+    _smaliFacts = _smaliFacts.filter(
+      f => f.file !== deletedPath && !f.file.startsWith(deletedPath + '/')
+    );
+    if (_smaliFacts.length !== beforeF) renderSmaliFacts();
+  }
+}
+
+async function openFileAtLine(path, line) {
+  await openFile(path);
+  setTimeout(() => {
+    const ta = document.getElementById('code-editor');
+    if (ta.style.display === 'none') return; // fichier binaire/image : pas de saut de ligne
+    const lines = ta.value.split('\n');
+    let pos = 0;
+    for (let i = 0; i < line - 1 && i < lines.length; i++) pos += lines[i].length + 1;
+    ta.focus();
+    ta.setSelectionRange(pos, pos + (lines[line - 1] || '').length);
+    const lineHeight = parseInt(getComputedStyle(ta).lineHeight) || 16;
+    ta.scrollTop = Math.max(0, (line - 5) * lineHeight);
+  }, 80);
+}
+
+// ─── Smali Facile : édition guidée sans connaître la syntaxe smali ──────────
+let _smaliFacts = [];
+let _smaliFilter = 'all';
+
+async function scanSmaliFacts() {
+  if (!window._currentSessionId) {
+    document.getElementById('smali-scan-status').textContent = 'Aucun projet chargé.';
+    return;
+  }
+  const status = document.getElementById('smali-scan-status');
+  status.textContent = 'Scan en cours…';
+  try {
+    const r = await fetch(`/smali-facts?session=${encodeURIComponent(window._currentSessionId)}`);
+    const data = await r.json();
+    if (data.error) { status.textContent = data.error; return; }
+    _smaliFacts = data.facts || [];
+    status.textContent = `${_smaliFacts.length} valeur(s) détectée(s)`;
+    document.getElementById('smali-facts-filters').style.display = _smaliFacts.length ? 'flex' : 'none';
+    renderSmaliFacts();
+  } catch (e) {
+    status.textContent = 'Erreur de scan.';
+  }
+}
+
+function setSmaliFilter(type) {
+  _smaliFilter = type;
+  document.querySelectorAll('#smali-facts-filters .chip').forEach(c => c.classList.toggle('active', c.dataset.ftype === type));
+  renderSmaliFacts();
+}
+
+const SMALI_TYPE_ICON = { color: '🎨', color_int: '🎨', text: '📝', duration: '⏱', url: '🔗' };
+
+function renderSmaliFacts() {
+  const list = document.getElementById('smali-facts-list');
+  const items = _smaliFilter === 'all' ? _smaliFacts : _smaliFacts.filter(f => f.type === _smaliFilter);
+  if (!items.length) {
+    list.innerHTML = `<div class="smali-fact-empty">${_smaliFacts.length ? 'Aucune valeur pour ce filtre.' : 'Clique sur "Scanner le projet" pour détecter les valeurs modifiables.'}</div>`;
+    return;
+  }
+  list.innerHTML = items.map(f => {
+    const icon = SMALI_TYPE_ICON[f.type] || '•';
+    let inputHtml;
+    if (f.type === 'color' || f.type === 'color_int') {
+      const hex6 = (f.value.length === 9 ? '#' + f.value.slice(3) : f.value).slice(0, 7); // color input veut #RRGGBB
+      inputHtml = `<input type="color" value="${esc(hex6)}" data-fid="${esc(f.id)}" oninput="onSmaliColorPick(this)">
+                   <input type="text" value="${esc(f.value)}" data-fid="${esc(f.id)}" class="smali-val-text">`;
+    } else if (f.type === 'duration') {
+      inputHtml = `<input type="number" min="0" value="${esc(f.value)}" data-fid="${esc(f.id)}" class="smali-val-text"><span style="font-size:11px;color:var(--muted)">ms</span>`;
+    } else {
+      inputHtml = `<input type="text" value="${esc(f.value)}" data-fid="${esc(f.id)}" class="smali-val-text">`;
+    }
+    return `
+      <div class="smali-fact" data-fid="${esc(f.id)}">
+        <div class="smali-fact-head">
+          <span>${icon} ${esc(f.label)}</span>
+          <span class="smali-fact-loc" title="${esc(f.file)}">${esc(f.file.split('/').pop())}:${f.line}</span>
+        </div>
+        <div class="smali-fact-row">
+          ${inputHtml}
+          <button class="btn-mini" onclick="applySmaliFact('${esc(f.id)}')">Appliquer</button>
+        </div>
+      </div>`;
+  }).join('');
+}
+
+function onSmaliColorPick(colorInput) {
+  const fid = colorInput.dataset.fid;
+  const textInput = document.querySelector(`.smali-fact[data-fid="${CSS.escape(fid)}"] .smali-val-text`);
+  if (textInput) {
+    // Conserve le canal alpha existant si présent (#AARRGGBB), sinon couleur pleine
+    const cur = textInput.value;
+    if (cur.length === 9) textInput.value = '#' + cur.slice(1, 3) + colorInput.value.slice(1);
+    else textInput.value = colorInput.value;
+  }
+}
+
+async function applySmaliFact(fid) {
+  const card = document.querySelector(`.smali-fact[data-fid="${CSS.escape(fid)}"]`);
+  if (!card) return;
+  const input = card.querySelector('.smali-val-text');
+  const value = input.value;
+  try {
+    const r = await fetch('/smali-apply', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session: window._currentSessionId, edits: [{ id: fid, value }] })
+    });
+    const data = await r.json();
+    const res = (data.results || [])[0];
+    if (res && res.ok) {
+      toast('Valeur appliquée ✓', 'ok');
+      const f = _smaliFacts.find(x => x.id === fid);
+      if (f) f.value = value;
+    } else {
+      toast((res && res.error) || 'Échec de l\'application', 'err');
+    }
+  } catch (e) {
+    toast('Erreur réseau', 'err');
+  }
+}
+
 
 function setUrlMode(m) {
   currentUrlMode = m;
@@ -2930,6 +3544,7 @@ function renderImageGrid() {
     // Clic gauche → menu d'options
     cell.addEventListener('click', (e) => {
       e.preventDefault();
+      e.stopPropagation();
       _showImgCtxMenu(e, img, cell);
     });
     // Clic droit → sélectionner / désélectionner
@@ -2946,16 +3561,22 @@ function renderImageGrid() {
 let _imgCtxTarget = null; // { img, cell }
 
 function _showImgCtxMenu(e, img, cell) {
+  if (e && e.stopPropagation) e.stopPropagation();
   _hideImgCtxMenu();
   _imgCtxTarget = { img, cell };
   const menu = document.getElementById('img-ctx-menu');
   document.getElementById('img-ctx-name').textContent = img.name;
-  // Positionner
+  // Positionner (avec marge de sécurité sur les 4 bords, pour que le menu
+  // ne soit jamais poussé hors écran — ex: titre/croix cachés en haut si
+  // le menu est plus haut que l'espace dispo en bas du clic)
   const vw = window.innerWidth, vh = window.innerHeight;
   let x = e.clientX, y = e.clientY;
   menu.style.display = 'block';
-  if (x + menu.offsetWidth  > vw - 8) x = vw - menu.offsetWidth  - 8;
-  if (y + menu.offsetHeight > vh - 8) y = vh - menu.offsetHeight - 8;
+  const mw = menu.offsetWidth, mh = menu.offsetHeight;
+  if (x + mw > vw - 8) x = vw - mw - 8;
+  if (y + mh > vh - 8) y = vh - mh - 8;
+  if (x < 8) x = 8;
+  if (y < 8) y = 8;
   menu.style.left = x + 'px';
   menu.style.top  = y + 'px';
   menu.classList.add('show');
@@ -2963,11 +3584,15 @@ function _showImgCtxMenu(e, img, cell) {
 
 function _hideImgCtxMenu() {
   const menu = document.getElementById('img-ctx-menu');
-  if (menu) menu.classList.remove('show');
+  if (menu) {
+    menu.classList.remove('show');
+    menu.style.display = 'none';
+  }
 }
 
 document.addEventListener('click', (e) => {
-  if (!e.target.closest('#img-ctx-menu')) _hideImgCtxMenu();
+  const menu = document.getElementById('img-ctx-menu');
+  if (menu && !menu.contains(e.target)) _hideImgCtxMenu();
 });
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') _hideImgCtxMenu();
@@ -3013,6 +3638,29 @@ async function _imgCtxAction(action) {
       openFile(img.path);
       toast(`✏️ Ouvert dans l'éditeur : ${img.name}`, 'ok');
     }
+
+  } else if (action === 'rename') {
+    const oldName = img.name;
+    openRenameModal(oldName, async (newName) => {
+      if (newName === oldName) { closeRenameModal(); return; }
+      const newPath = img.path.replace(/[^/]+$/, newName);
+      toast(`⏳ Renommage de ${oldName} → ${newName}…`, '');
+      const r = await fetch('/rename', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: img.path, newPath, updateRefs: true })
+      });
+      const d = await r.json();
+      if (d.error) { throw new Error(d.error); }
+      const n = d.refsUpdated || 0;
+      toast(`✅ Renommé → ${newName}` + (n ? ` (${n} référence${n > 1 ? 's' : ''} mise${n > 1 ? 's' : ''} à jour)` : ''), 'ok');
+      if (d.nameAmbiguous) {
+        toast(`⚠ "${oldName}" existe ailleurs dans le projet (ex: autre dossier drawable) — seules les références au chemin complet ont été mises à jour, pas le nom seul`, 'err');
+      }
+      await refreshImagePicker();
+      loadTree();
+      if (currentFile && currentFile.path === img.path) closeEditor();
+    });
 
   } else if (action === 'delete') {
     if (!confirm(`Supprimer définitivement "${img.name}" ?`)) return;
@@ -4608,21 +5256,25 @@ async function ctxAction(action) {
     triggerReplaceAny(path);
 
   } else if (action === 'rename') {
-    const newName = prompt(`Nouveau nom pour "${name}" :`, name);
-    if (!newName || newName === name) return;
-    const newPath = path.replace(/[^/]+$/, newName);
-    try {
+    openRenameModal(name, async (newName) => {
+      if (newName === name) { closeRenameModal(); return; }
+      const newPath = path.replace(/[^/]+$/, newName);
+      toast(`⏳ Renommage de ${name} → ${newName}…`, '');
       const r = await fetch('/rename', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path, newPath })
+        body: JSON.stringify({ path, newPath, updateRefs: true })
       });
       const d = await r.json();
-      if (d.error) { toast(d.error, 'err'); return; }
-      toast(`Renommé → ${newName}`, 'ok');
+      if (d.error) { throw new Error(d.error); }
+      const n = d.refsUpdated || 0;
+      toast(`✅ Renommé → ${newName}` + (n ? ` (${n} référence${n > 1 ? 's' : ''} mise${n > 1 ? 's' : ''} à jour)` : ''), 'ok');
+      if (d.nameAmbiguous) {
+        toast(`⚠ "${name}" existe ailleurs dans le projet (ex: autre dossier drawable) — seules les références au chemin complet ont été mises à jour, pas le nom seul`, 'err');
+      }
       loadTree();
       if (currentFile && currentFile.path === path) closeEditor();
-    } catch(e) { toast('Erreur rename', 'err'); }
+    });
 
   } else if (action === 'copy-path') {
     navigator.clipboard.writeText(path).then(() => toast('Chemin copié: ' + path, 'ok'));
@@ -4656,7 +5308,8 @@ async function ctxAction(action) {
       if (d.error) { toast(d.error, 'err'); return; }
       toast('Supprimé: ' + name, 'ok');
       if (currentFile && currentFile.path === path) closeEditor();
-      loadTree();
+      await loadTree();
+      removeFromSearchResultsAfterDelete(path);
     } catch(e) { toast('Erreur suppression', 'err'); }
   }
 }
@@ -4793,7 +5446,7 @@ async function replaceCurrentImage(input) {
 </script>
 <!-- ── Menu contextuel grille d'images (clic gauche) ── -->
 <div id="img-ctx-menu">
-  <div class="img-ctx-title" id="img-ctx-name">image.png <button onclick="_hideImgCtxMenu()" style="margin-left:auto;background:none;border:none;cursor:pointer;color:var(--muted);font-size:14px;line-height:1;padding:0 2px;flex-shrink:0" title="Fermer">✕</button></div>
+  <div class="img-ctx-title"><span id="img-ctx-name">image.png</span> <button type="button" class="img-ctx-close" onclick="_hideImgCtxMenu()" title="Fermer">✕</button></div>
   <div class="img-ctx-item highlight" onclick="_imgCtxAction('select')">☑ Sélectionner / désélectionner</div>
   <div class="img-ctx-sep"></div>
   <div class="img-ctx-item" onclick="_imgCtxAction('use-splash')">✨ Utiliser comme splash</div>
@@ -4801,6 +5454,7 @@ async function replaceCurrentImage(input) {
   <div class="img-ctx-sep"></div>
   <div class="img-ctx-item" onclick="_imgCtxAction('replace')">🔄 Remplacer par un fichier local</div>
   <div class="img-ctx-item" onclick="_imgCtxAction('open-editor')">✏️ Ouvrir dans l'éditeur</div>
+  <div class="img-ctx-item" onclick="_imgCtxAction('rename')">✏️ Renommer…</div>
   <div class="img-ctx-sep"></div>
   <div class="img-ctx-item danger" onclick="_imgCtxAction('delete')">🗑 Supprimer</div>
 </div>

@@ -12,4 +12,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   // Ouvrir un lien dans le vrai navigateur (paiement FedaPay, support, etc.)
   openExternal: (url) => ipcRenderer.send('open-external', url),
+
+  // Auto-updater
+  onUpdateAvailable: (cb) => ipcRenderer.on('update-available', (_, data) => cb(data)),
+  onUpdateProgress:  (cb) => ipcRenderer.on('update-progress',  (_, data) => cb(data)),
+  checkForUpdates:   ()   => ipcRenderer.invoke('check-for-updates'),
 });
