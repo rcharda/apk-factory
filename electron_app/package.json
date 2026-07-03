@@ -26,27 +26,28 @@
     "files": [
       "main.js",
       "preload.js",
+      "setup.js",
       "package.json"
     ],
     "extraResources": [
       {
-        "from": "../server.py",
+        "from": "server.py",
         "to": "server.py"
       },
       {
-        "from": "../builder.html",
+        "from": "builder.html",
         "to": "builder.html"
       },
       {
-        "from": "../license.html",
+        "from": "license.html",
         "to": "license.html"
       },
       {
-        "from": "../license-renderer.js",
+        "from": "license-renderer.js",
         "to": "license-renderer.js"
       },
       {
-        "from": "../tools",
+        "from": "tools",
         "to": "tools",
         "filter": [
           "**/*",
@@ -54,14 +55,14 @@
         ]
       },
       {
-        "from": "../output",
+        "from": "output",
         "to": "output",
         "filter": [
           "**/*"
         ]
       },
       {
-        "from": "../workspace",
+        "from": "workspace",
         "to": "workspace",
         "filter": [
           "*.apk",
@@ -85,7 +86,7 @@
         }
       ],
       "requestedExecutionLevel": "asInvoker",
-      "icon": "../assets/icon.ico"
+      "icon": "assets/icon.ico"
     },
     "nsis": {
       "oneClick": false,
@@ -94,9 +95,11 @@
       "createStartMenuShortcut": true,
       "shortcutName": "APK Factory Pro",
       "deleteAppDataOnUninstall": false,
-      "installerIcon": "../assets/icon.ico",
-      "installerHeaderIcon": "../assets/icon.ico",
-      "uninstallerIcon": "../assets/icon.ico"
+      "installerIcon": "assets/icon.ico",
+      "installerHeaderIcon": "assets/icon.ico",
+      "uninstallerIcon": "assets/icon.ico",
+      "multiLanguageInstaller": false,
+      "installerLanguages": ["en_US"]
     },
     "compression": "normal",
     "publish": {

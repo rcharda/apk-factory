@@ -250,6 +250,13 @@ def run_cmd_capture(cmd, logger, cwd=None, timeout=60):
     return r.returncode == 0, (r.stdout or "")
 
 def _candidates(name):
+    # setup.js installe certains outils "file" (ex: apktool) dans un SOUS-DOSSIER
+    # portant le même nom que l'outil : tools/apktool/apktool.jar. On teste donc
+    # aussi TOOLS_DIR/name/name.jar (et .bat/.exe) avant les formes à plat, pour
+    # matcher exactement la disposition produite par setup.js.
+    yield TOOLS_DIR / name / (name + ".jar")
+    yield TOOLS_DIR / name / (name + ".bat")
+    yield TOOLS_DIR / name / (name + ".exe")
     yield TOOLS_DIR / name
     yield TOOLS_DIR / (name + ".jar")
     yield TOOLS_DIR / (name + ".bat")
@@ -266,7 +273,10 @@ def _candidates(name):
 
 def find_tool(name):
     for c in _candidates(name):
-        if c.exists(): return str(c)
+        # .is_file() (pas .exists()) : un DOSSIER portant le nom de l'outil
+        # (ex: tools/apktool/ contenant apktool.jar) ne doit jamais être
+        # retourné comme si c'était le binaire lui-même.
+        if c.is_file(): return str(c)
     return shutil.which(name)
 
 def find_build_tools_version():
@@ -353,6 +363,29 @@ def make_icon_png(src_bytes, size):
     return _make_solid_png(size, size)
 
 
+def make_splash_png(src_bytes, canvas_w, canvas_h, bg_color=(255, 255, 255, 255)):
+    """Génère une image plein écran canvas_w×canvas_h avec le logo/icône
+    fourni centré et redimensionné pour occuper ~50% de la plus petite
+    dimension du canvas, sur un fond uni — convention visuelle standard
+    des générateurs de splash screen (flutter_native_splash, cordova-
+    splash) : le logo n'est jamais étiré en plein écran. Utilisé pour
+    brancher le splash screen par densité sur Cordova/Flutter/React
+    Native, qui ne le géraient jusqu'ici pas (seule l'icône l'était)."""
+    if not PIL_AVAILABLE or not src_bytes:
+        return _make_solid_png(canvas_w, canvas_h, *bg_color[:3], bg_color[3] if len(bg_color) > 3 else 255)
+    try:
+        logo = Image.open(io.BytesIO(src_bytes)).convert("RGBA")
+        target = max(1, int(min(canvas_w, canvas_h) * 0.5))
+        logo.thumbnail((target, target), Image.LANCZOS)
+        canvas = Image.new("RGBA", (canvas_w, canvas_h), bg_color)
+        x = (canvas_w - logo.width) // 2
+        y = (canvas_h - logo.height) // 2
+        canvas.paste(logo, (x, y), logo)
+        buf = io.BytesIO(); canvas.save(buf, format="PNG"); return buf.getvalue()
+    except Exception:
+        return _make_solid_png(canvas_w, canvas_h, *bg_color[:3], bg_color[3] if len(bg_color) > 3 else 255)
+
+
 # =============================================================
 # GÉNÉRATION DU CODE SOURCE (smali + ressources + manifeste)
 # — AUCUN TEMPLATE REQUIS —
@@ -399,7 +432,7 @@ RUNTIME_DANGEROUS_PERMISSIONS = [
 
 
 def _smali_main(package, url_or_asset, mode, orientation="unspecified", allow_file_access=None,
-                 permissions=None):
+                 permissions=None, fullscreen=False, immersive=False, lock_task=False):
     """
     Génère le smali de MainActivity — compatible Android 6 (API 23) → 16+.
     mode: 'url'   → loadUrl(url_or_asset)
@@ -411,6 +444,22 @@ def _smali_main(package, url_or_asset, mode, orientation="unspecified", allow_fi
                  demandées au runtime via requestPermissions() avant le chargement
                  de l'URL (CRITIQUE #2 — sans ça CAMERA/RECORD_AUDIO/GPS restent
                  refusées en silence par la WebView même si cochées dans l'UI).
+    fullscreen: si False (défaut) — l'app reste dans les limites normales de
+                l'écran (barre de statut / barre de navigation visibles,
+                aucun flag plein écran / edge-to-edge). Si True — comportement
+                immersif d'origine (masque les barres système).
+    immersive: si True — cache la barre de navigation (boutons Retour/Accueil/
+               Récents ou bande gestuelle) en mode "immersive sticky". Un swipe
+               depuis le bord la fait réapparaître temporairement — ce n'est
+               PAS un verrou, juste une dissimulation visuelle. Ne touche pas
+               à la barre de statut (indépendant de `fullscreen`).
+    lock_task: si True — appelle Activity.startLockTask() au lancement
+               ("screen pinning"). Sur un appareil sans droits Device Owner,
+               Android affiche une confirmation système la première fois
+               ("Épingler cette appli ?"). Une fois épinglée, Accueil et
+               Récents sont réellement désactivés jusqu'à ce que l'utilisateur
+               fasse le geste de déverrouillage (maintenir Retour + Récents,
+               selon la version d'Android).
     """
     if allow_file_access is None:
         allow_file_access = (mode in ("asset", "www"))
@@ -469,6 +518,119 @@ def _smali_main(package, url_or_asset, mode, orientation="unspecified", allow_fi
     else:
         permission_request_block = ""
 
+    if fullscreen:
+        fullscreen_block = '''
+    # -- Plein écran selon la version Android --
+    # FLAG_FULLSCREEN (0x400) est déprécié depuis Android 11 (API 30) et n'a
+    # plus aucun effet quand targetSdk >= 35 (edge-to-edge forcé par le
+    # système). Sans ce correctif, le contenu de la WebView se superposait
+    # à la barre de statut sur Android 15+ (rendu cassé, pas un crash mais
+    # visuellement faux). On détecte donc la version au runtime :
+    #   - API >= 30 : Window.setDecorFitsSystemWindows(false) — méthode
+    #     moderne, gère correctement l'edge-to-edge sur Android 11 à 16+.
+    #   - API < 30  : ancien FLAG_FULLSCREEN, qui fonctionne normalement
+    #     sur ces versions plus anciennes et ne doit pas être retiré pour
+    #     elles (sinon régression visuelle sur Android 6-10).
+    sget v0, Landroid/os/Build$VERSION;->SDK_INT:I
+    const/16 v1, 0x1e
+    if-lt v0, v1, :use_legacy_fullscreen
+
+    invoke-virtual {p0}, Landroid/app/Activity;->getWindow()Landroid/view/Window;
+    move-result-object v0
+    const/4 v1, 0x0
+    invoke-virtual {v0, v1}, Landroid/view/Window;->setDecorFitsSystemWindows(Z)V
+    goto :fullscreen_done
+
+    :use_legacy_fullscreen
+    invoke-virtual {p0}, Landroid/app/Activity;->getWindow()Landroid/view/Window;
+    move-result-object v0
+    const v1, 0x400
+    invoke-virtual {v0, v1}, Landroid/view/Window;->addFlags(I)V
+
+    :fullscreen_done'''
+    else:
+        # -- Reste dans les limites normales de l'écran --
+        # On ne pose aucun flag plein écran / edge-to-edge : le système
+        # réserve nativement l'espace de la barre de statut et de la barre
+        # de navigation, et le contenu de la WebView ne passe jamais sous
+        # ces barres. C'est le comportement par défaut souhaité (cf. case
+        # à cocher "Plein écran" dans le builder — décochée par défaut).
+        fullscreen_block = ""
+
+    # -- Fragment réutilisable : masque la barre de navigation (Retour/
+    # Accueil/Récents) en mode immersive sticky. N'utilise QUE v0/v1 pour
+    # rester injectable aussi bien dans onCreate (5 locaux dispo) que dans
+    # onWindowFocusChanged (2 locaux dispo) sans conflit avec p0/p1.
+    #   - API >= 30 : WindowInsetsController.hide(navigationBars()) +
+    #     BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE (0x2) — méthode moderne.
+    #   - API < 30  : ancien View.setSystemUiVisibility() avec les flags
+    #     LAYOUT_STABLE(0x100) | LAYOUT_HIDE_NAVIGATION(0x200) |
+    #     HIDE_NAVIGATION(0x002) | IMMERSIVE_STICKY(0x1000) = 0x1302.
+    _immersive_apply_fragment = '''
+    sget v0, Landroid/os/Build$VERSION;->SDK_INT:I
+    const/16 v1, 0x1e
+    if-lt v0, v1, :use_legacy_immersive
+
+    invoke-virtual {p0}, Landroid/app/Activity;->getWindow()Landroid/view/Window;
+    move-result-object v0
+    invoke-virtual {v0}, Landroid/view/Window;->getInsetsController()Landroid/view/WindowInsetsController;
+    move-result-object v0
+    if-eqz v0, :immersive_done
+    invoke-static {}, Landroid/view/WindowInsets$Type;->navigationBars()I
+    move-result v1
+    invoke-interface {v0, v1}, Landroid/view/WindowInsetsController;->hide(I)V
+    const/4 v1, 0x2
+    invoke-interface {v0, v1}, Landroid/view/WindowInsetsController;->setSystemBarsBehavior(I)V
+    goto :immersive_done
+
+    :use_legacy_immersive
+    invoke-virtual {p0}, Landroid/app/Activity;->getWindow()Landroid/view/Window;
+    move-result-object v0
+    invoke-virtual {v0}, Landroid/view/Window;->getDecorView()Landroid/view/View;
+    move-result-object v0
+    const v1, 0x1302
+    invoke-virtual {v0, v1}, Landroid/view/View;->setSystemUiVisibility(I)V
+
+    :immersive_done'''
+
+    if immersive:
+        immersive_block = _immersive_apply_fragment
+        immersive_refocus_method = f'''
+# Ré-applique le mode immersif quand la fenêtre reprend le focus — sans ça,
+# ouvrir une autre appli puis revenir fait réapparaître la barre de nav
+# de façon définitive sur certains appareils/versions.
+.method public onWindowFocusChanged(Z)V
+    .registers 4
+    .param p1, "hasFocus"
+    invoke-super {{p0, p1}}, Landroid/app/Activity;->onWindowFocusChanged(Z)V
+    if-eqz p1, :focus_not_gained
+{_immersive_apply_fragment}
+    :focus_not_gained
+    return-void
+.end method
+'''
+    else:
+        immersive_block = ""
+        immersive_refocus_method = ""
+
+    if lock_task:
+        # startLockTask() ("screen pinning") est disponible depuis API 21
+        # sans aucun droit spécial — sur un appareil non Device Owner,
+        # Android affiche une confirmation système au premier appel. On
+        # capture l'exception (rare, ex. politique appareil qui l'interdit)
+        # pour ne jamais faire planter l'app au lancement.
+        lock_task_block = '''
+    :try_start_locktask
+    invoke-virtual {p0}, Landroid/app/Activity;->startLockTask()V
+    :try_end_locktask
+    .catch Ljava/lang/Exception; {:try_start_locktask .. :try_end_locktask} :catch_locktask
+    goto :locktask_done
+    :catch_locktask
+    move-exception v0
+    :locktask_done'''
+    else:
+        lock_task_block = ""
+
     # onBackPressed est déprécié Android 13+ (API 33) mais on le garde pour compat.
     # On utilise également shouldOverrideUrlLoading(WebView, WebResourceRequest) — API 24+
     # ET la version legacy (String) pour couvrir API <24.
@@ -493,35 +655,8 @@ def _smali_main(package, url_or_asset, mode, orientation="unspecified", allow_fi
     # -- Masquer le titre/ActionBar --
     const/4 v0, 0x1
     invoke-virtual {{p0, v0}}, Landroid/app/Activity;->requestWindowFeature(I)Z
-
-    # -- Plein écran selon la version Android --
-    # FLAG_FULLSCREEN (0x400) est déprécié depuis Android 11 (API 30) et n'a
-    # plus aucun effet quand targetSdk >= 35 (edge-to-edge forcé par le
-    # système). Sans ce correctif, le contenu de la WebView se superposait
-    # à la barre de statut sur Android 15+ (rendu cassé, pas un crash mais
-    # visuellement faux). On détecte donc la version au runtime :
-    #   - API >= 30 : Window.setDecorFitsSystemWindows(false) — méthode
-    #     moderne, gère correctement l'edge-to-edge sur Android 11 à 16+.
-    #   - API < 30  : ancien FLAG_FULLSCREEN, qui fonctionne normalement
-    #     sur ces versions plus anciennes et ne doit pas être retiré pour
-    #     elles (sinon régression visuelle sur Android 6-10).
-    sget v0, Landroid/os/Build$VERSION;->SDK_INT:I
-    const/16 v1, 0x1e
-    if-lt v0, v1, :use_legacy_fullscreen
-
-    invoke-virtual {{p0}}, Landroid/app/Activity;->getWindow()Landroid/view/Window;
-    move-result-object v0
-    const/4 v1, 0x0
-    invoke-virtual {{v0, v1}}, Landroid/view/Window;->setDecorFitsSystemWindows(Z)V
-    goto :fullscreen_done
-
-    :use_legacy_fullscreen
-    invoke-virtual {{p0}}, Landroid/app/Activity;->getWindow()Landroid/view/Window;
-    move-result-object v0
-    const v1, 0x400
-    invoke-virtual {{v0, v1}}, Landroid/view/Window;->addFlags(I)V
-
-    :fullscreen_done
+{fullscreen_block}
+{immersive_block}
 {permission_request_block}
     # -- Créer le WebView --
     new-instance v0, Landroid/webkit/WebView;
@@ -554,10 +689,10 @@ def _smali_main(package, url_or_asset, mode, orientation="unspecified", allow_fi
 {"" if not allow_file_access else """    # setAllowFileAccessFromFileURLs(true) — accès assets locaux (modes asset/www uniquement)
     # Inutile et déprécié Android 16+ en mode URL réseau — omis volontairement en mode url
     const/4 v2, 0x1
-    invoke-virtual {{v1, v2}}, Landroid/webkit/WebSettings;->setAllowFileAccessFromFileURLs(Z)V
+    invoke-virtual {v1, v2}, Landroid/webkit/WebSettings;->setAllowFileAccessFromFileURLs(Z)V
 
     # setAllowUniversalAccessFromFileURLs(true)
-    invoke-virtual {{v1, v2}}, Landroid/webkit/WebSettings;->setAllowUniversalAccessFromFileURLs(Z)V
+    invoke-virtual {v1, v2}, Landroid/webkit/WebSettings;->setAllowUniversalAccessFromFileURLs(Z)V
 """}
     # -- Activer la géolocalisation côté WebSettings (requis en complément de
     #    onGeolocationPermissionsShowPrompt pour que navigator.geolocation
@@ -585,8 +720,17 @@ def _smali_main(package, url_or_asset, mode, orientation="unspecified", allow_fi
     const-string v1, "{load_url}"
     invoke-virtual {{v0, v1}}, Landroid/webkit/WebView;->loadUrl(Ljava/lang/String;)V
 
+    # -- Listener d'insets (edge-to-edge fix, cf. InternalInsetsListener) --
+    # Doit être enregistré avant setContentView pour être appelé dès le
+    # premier attach de la WebView à la fenêtre (dispatch automatique des
+    # WindowInsets par le système à ce moment-là).
+    new-instance v1, L{pkg_smali}/InternalInsetsListener;
+    invoke-direct {{v1}}, L{pkg_smali}/InternalInsetsListener;-><init>()V
+    invoke-virtual {{v0, v1}}, Landroid/view/View;->setOnApplyWindowInsetsListener(Landroid/view/View$OnApplyWindowInsetsListener;)V
+
     # -- Afficher le WebView --
     invoke-virtual {{p0, v0}}, Landroid/app/Activity;->setContentView(Landroid/view/View;)V
+{lock_task_block}
     return-void
 .end method
 
@@ -604,6 +748,7 @@ def _smali_main(package, url_or_asset, mode, orientation="unspecified", allow_fi
     invoke-super {{p0}}, Landroid/app/Activity;->onBackPressed()V
     return-void
 .end method
+{immersive_refocus_method}
 '''
 
 
@@ -648,6 +793,72 @@ def _smali_webchromeclient(package):
     const/4 v1, 0x0
     invoke-interface {{p2, p1, v0, v1}}, Landroid/webkit/GeolocationPermissions$Callback;->invoke(Ljava/lang/String;ZZ)V
     return-void
+.end method
+'''
+
+
+def _smali_insetslistener(package):
+    """
+    Sous-classe de View.OnApplyWindowInsetsListener — FIX EDGE-TO-EDGE.
+    Depuis Android 15 (targetSdk 35), le système force l'affichage
+    edge-to-edge : impossible de désactiver via setDecorFitsSystemWindows.
+    Sans cette classe, le contenu de la WebView (header du chat, boutons,
+    barre de nav de la page web) passe sous la barre de statut système et
+    devient inatteignable au clic. On applique donc un padding-top/bottom
+    égal aux insets système (barre de statut + barre de navigation) sur la
+    WebView elle-même, à chaque dispatch de WindowInsets.
+    On utilise volontairement les méthodes DÉPRÉCIÉES getSystemWindowInset*
+    plutôt que WindowInsets.Type (API 30+) : elles restent pleinement
+    fonctionnelles sur toutes les API (21 à 35+, calculées automatiquement
+    par le système pour la compatibilité) et évitent tout branchement
+    conditionnel par version dans ce smali généré.
+    """
+    pkg_smali = package.replace(".", "/")
+    return f'''.class public L{pkg_smali}/InternalInsetsListener;
+.super Ljava/lang/Object;
+.source "InternalInsetsListener.java"
+.implements Landroid/view/View$OnApplyWindowInsetsListener;
+
+.method public constructor <init>()V
+    .registers 1
+    invoke-direct {{p0}}, Ljava/lang/Object;-><init>()V
+    return-void
+.end method
+
+# onApplyWindowInsets — applique le padding top/bottom sur la vue (WebView)
+# pour que son contenu ne passe plus sous la barre de statut / de nav.
+.method public onApplyWindowInsets(Landroid/view/View;Landroid/view/WindowInsets;)Landroid/view/WindowInsets;
+    .registers 11
+    .param p1, "v"
+    .param p2, "insets"
+
+    invoke-virtual {{p2}}, Landroid/view/WindowInsets;->getSystemWindowInsetTop()I
+    move-result v0
+    invoke-virtual {{p2}}, Landroid/view/WindowInsets;->getSystemWindowInsetBottom()I
+    move-result v1
+    invoke-virtual {{p2}}, Landroid/view/WindowInsets;->getSystemWindowInsetLeft()I
+    move-result v2
+    invoke-virtual {{p2}}, Landroid/view/WindowInsets;->getSystemWindowInsetRight()I
+    move-result v3
+
+    # -- DEBUG : log les valeurs d'insets calculées (à retirer une fois le
+    #    fix confirmé). Filtre logcat : "InsetsListener"
+    const-string v4, "InsetsListener"
+    new-instance v5, Ljava/lang/StringBuilder;
+    invoke-direct {{v5}}, Ljava/lang/StringBuilder;-><init>()V
+    const-string v6, "onApplyWindowInsets appele - top="
+    invoke-virtual {{v5, v6}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    invoke-virtual {{v5, v0}}, Ljava/lang/StringBuilder;->append(I)Ljava/lang/StringBuilder;
+    const-string v6, " bottom="
+    invoke-virtual {{v5, v6}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    invoke-virtual {{v5, v1}}, Ljava/lang/StringBuilder;->append(I)Ljava/lang/StringBuilder;
+    invoke-virtual {{v5}}, Ljava/lang/StringBuilder;->toString()Ljava/lang/String;
+    move-result-object v7
+    invoke-static {{v4, v7}}, Landroid/util/Log;->d(Ljava/lang/String;Ljava/lang/String;)I
+
+    invoke-virtual {{p1, v2, v0, v3, v1}}, Landroid/view/View;->setPadding(IIII)V
+
+    return-object p2
 .end method
 '''
 
@@ -714,7 +925,6 @@ def _manifest_xml(package, app_name, version_code, version_name,
     # configChanges étendu pour Android 14+
     config_changes = "orientation|keyboardHidden|screenSize|smallestScreenSize|screenLayout|density|uiMode"
     target_int = int(target_sdk) if str(target_sdk).isdigit() else 34
-    min_int    = int(min_sdk) if str(min_sdk).isdigit() else 23
 
     # Construction des attributs optionnels — on évite les lignes vides dans le XML
     app_attrs = [
@@ -806,6 +1016,8 @@ sdkInfo:
   targetSdkVersion: '{target_sdk}'
 sharedLibrary: false
 sparseResources: false
+doNotCompress:
+- resources.arsc
 unknownFiles: {{}}
 usesFramework:
   ids:
@@ -987,8 +1199,8 @@ def list_sessions():
                 "session": d.name,
                 "created": meta.get("created"),
                 "packageOld": meta.get("package", meta.get("packageOld")),
-                "hasDecompiled": (d / "source").exists() or (d / "decompiled").exists(),
-                "origin": meta.get("origin", "scratch"),  # "scratch" | "decompile"
+                "hasDecompiled": any((d / name).exists() for name in PROJECT_ROOT_SUBDIRS),
+                "origin": meta.get("origin", "scratch"),  # "scratch" | "decompile" | "cordova" | "flutter" | "reactnative"
             })
     return out
 
@@ -996,11 +1208,121 @@ def delete_session(sid):
     sd = session_dir(sid)
     if sd.exists(): shutil.rmtree(sd)
 
+def build_project_overview(sid):
+    """Vue d'ensemble condensée d'une session, pensée pour l'agent IA.
+
+    Objectif : en UN SEUL appel HTTP, l'agent obtient tout le contexte dont
+    il a besoin pour raisonner sur le projet (type de pipeline, arborescence,
+    fichiers de config déjà lisibles, état de santé) — au lieu d'enchaîner
+    une dizaine d'appels /tree puis /file en devinant les chemins. Sert de
+    point d'entrée systématique avant toute modification autonome.
+    """
+    sd = session_dir(sid)
+    meta = {}
+    meta_f = sd / "session.json"
+    if meta_f.exists():
+        try:
+            meta = json.loads(meta_f.read_text(encoding="utf-8"))
+        except Exception:
+            meta = {}
+
+    root = resolve_session_root(sid)
+    origin = meta.get("origin", "scratch")
+
+    try:
+        tree = list_tree_all(sid)
+    except Exception:
+        tree = []
+    tree_files = [t for t in tree if t.get("type") == "file"]
+
+    # Fichiers de config qu'on tente de lire en clair pour donner du contexte
+    # immédiat, sans que l'agent ait à deviner leur chemin exact selon le
+    # pipeline (scratch/décompilé/cordova/flutter/react native).
+    CANDIDATE_CONFIG_FILES = [
+        "AndroidManifest.xml",
+        "app/src/main/AndroidManifest.xml",
+        "android/app/src/main/AndroidManifest.xml",
+        "platforms/android/app/src/main/AndroidManifest.xml",
+        "build.gradle", "app/build.gradle", "android/app/build.gradle",
+        "config.xml",                     # Cordova
+        "pubspec.yaml",                   # Flutter
+        "package.json",                   # React Native
+        "apktool.yml",                    # décompilé (apktool)
+    ]
+    configs = {}
+    for rel in CANDIDATE_CONFIG_FILES:
+        try:
+            p = (root / rel)
+            if p.is_file() and p.stat().st_size < 40_000:
+                configs[rel] = p.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+    smali_count = 0
+    try:
+        smali_count = len(scan_smali_facts(sid, max_facts=2000))
+    except Exception:
+        pass
+
+    health = {}
+    try:
+        health = buglog_compute_health()
+    except Exception:
+        pass
+
+    MAX_TREE_ITEMS = 800  # on tronque pour ne pas noyer le modèle de contexte
+    return {
+        "session": sid,
+        "origin": origin,
+        "appName": meta.get("appName"),
+        "package": meta.get("package") or meta.get("packageOld"),
+        "created": meta.get("created"),
+        "rootExists": root.exists(),
+        "fileCount": len(tree_files),
+        "dirCount": max(0, len(tree) - len(tree_files)),
+        "tree": tree[:MAX_TREE_ITEMS],
+        "treeTruncated": len(tree) > MAX_TREE_ITEMS,
+        "configFiles": configs,
+        "smaliFactsCount": smali_count,
+        "health": health,
+    }
+
+def write_hybrid_session_meta(sid, origin, config):
+    """Écrit session.json pour une session Cordova/Flutter/React Native,
+    afin qu'elle apparaisse dans /sessions (panneau Sessions) et soit
+    reconnue par l'explorer/config-panel comme une session normale,
+    au même titre que scratch/template/décompilé."""
+    meta = {
+        "created": time.time(),
+        "package": (config.get("packageName") or "").strip(),
+        "packageOld": (config.get("packageName") or "").strip(),
+        "appName": (config.get("appName") or "MonApp").strip(),
+        "origin": origin,  # "cordova" | "flutter" | "reactnative"
+    }
+    (session_dir(sid) / "session.json").write_text(json.dumps(meta), encoding="utf-8")
+
+PROJECT_ROOT_SUBDIRS = [
+    "source",            # scratch / template (v3)
+    "decompiled",        # legacy (v2)
+    "cordova_project",
+    "flutter_project",
+    "rn_project",
+]
+
+def resolve_session_root(sid):
+    """Retourne le dossier racine du projet éditable pour une session,
+    quelle que soit son origine (scratch, template, décompilé, cordova,
+    flutter, react native). Retombe sur source_dir(sid) si rien n'existe
+    encore (comportement historique)."""
+    sd = session_dir(sid)
+    for name in PROJECT_ROOT_SUBDIRS:
+        p = sd / name
+        if p.exists():
+            return p
+    return source_dir(sid)
+
 def _safe_target(sid, rel_path):
-    # Supporte à la fois source/ (v3) et decompiled/ (v2 legacy)
-    sdir_v3 = source_dir(sid).resolve()
-    sdir_v2 = (session_dir(sid) / "decompiled").resolve()
-    sdir = sdir_v3 if sdir_v3.exists() else sdir_v2
+    sdir = resolve_session_root(sid).resolve()
     rel_path = (rel_path or "").lstrip("/\\")
     target = (sdir / rel_path).resolve()
     if not str(target).startswith(str(sdir)):
@@ -1008,9 +1330,7 @@ def _safe_target(sid, rel_path):
     return sdir, target
 
 def list_tree_all(sid):
-    sdir_v3 = source_dir(sid)
-    sdir_v2 = session_dir(sid) / "decompiled"
-    sdir = sdir_v3 if sdir_v3.exists() else sdir_v2
+    sdir = resolve_session_root(sid)
     if not sdir.exists(): return []
     items = []
     for p in sorted(sdir.rglob('*'), key=lambda x: str(x).lower()):
@@ -1032,15 +1352,147 @@ def read_file_safe(sid, rel_path):
             return {"text": False, "reason": "binary", "size": size}
     return {"text": False, "reason": "binary_type", "size": size, "ext": ext}
 
+def _snapshot_history(sid, rel_path, data_bytes):
+    """Conserve une copie horodatée de chaque écriture de fichier dans
+    session_dir(sid)/.history/, pour permettre à /export-zip de reconstituer
+    TOUT l'historique de fichiers générés pendant la session (pas juste
+    l'état final). Best-effort : une erreur ici ne doit jamais casser
+    l'écriture réelle du fichier.
+    """
+    try:
+        hist_dir = session_dir(sid) / ".history"
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        safe_rel = rel_path.replace("\\", "/").strip("/")
+        dest = hist_dir / f"{ts}__{new_session_id()[:8]}" / safe_rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data_bytes)
+    except Exception:
+        pass
+
+_GRADLE_JAVA_ORIGINS = ("cordova", "flutter", "reactnative")
+
+def _session_origin(sid):
+    """Lit l'origine d'une session depuis session.json ('cordova', 'flutter',
+    'reactnative', ou '' pour un projet scratch/template/natif décompilé qui
+    passe par apktool sur un arbre smali)."""
+    try:
+        meta_path = session_dir(sid) / "session.json"
+        if meta_path.exists():
+            return json.loads(meta_path.read_text(encoding="utf-8")).get("origin", "")
+    except Exception:
+        pass
+    return ""
+
 def write_file_safe(sid, rel_path, content):
+    if str(rel_path).endswith('.smali'):
+        smali_errors = _smali_quick_check(rel_path, content)
+        if smali_errors:
+            raise ValueError(
+                "Syntaxe smali invalide dans '" + str(rel_path) + "' — fichier NON écrit :\n- "
+                + "\n- ".join(smali_errors)
+            )
+    # BUG constaté : l'IA écrivait parfois un fichier .java (mise en page
+    # Gradle type app/src/main/java/...) dans une session scratch/template/
+    # native-décompilée, dont le pipeline de compilation est EXCLUSIVEMENT
+    # apktool sur un arbre smali (recompile_session) — il n'existe aucun
+    # compilateur Java/Kotlin pour ce type de session. Le fichier .java est
+    # alors ignoré par apktool et la compilation échoue avec un message
+    # générique, sans que l'IA comprenne pourquoi. Seules les sessions
+    # cordova/flutter/reactnative utilisent un vrai pipeline Gradle
+    # (_recompile_hybrid_session) où .java/.kt sont légitimes.
+    if str(rel_path).endswith(('.java', '.kt')) and _session_origin(sid) not in _GRADLE_JAVA_ORIGINS:
+        raise ValueError(
+            "Fichier NON écrit : '" + str(rel_path) + "' — ce type de projet (scratch/template/natif "
+            "décompilé) compile UNIQUEMENT via apktool sur du smali, il n'existe aucun compilateur "
+            "Java/Kotlin ici. N'écris jamais de .java/.kt dans ce projet : édite le .smali existant "
+            "(cherche-le avec search_project ou get_smali_facts) au lieu de créer un fichier Java. "
+            "Le Java/Kotlin n'est utilisable que dans un projet créé en mode cordova/flutter/reactnative."
+        )
     sdir, target = _safe_target(sid, rel_path)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content, encoding="utf-8")
+    _snapshot_history(sid, rel_path, content.encode("utf-8"))
+
+# -------------------------------------------------------------------------
+# Validation rapide de syntaxe smali AVANT écriture disque.
+# Objectif : attraper l'erreur la plus fréquente commise par l'IA quand elle
+# écrit du smali "à la main" — utiliser une syntaxe de tableau façon Java
+# (ex: `new-array v0, {"a", "b"}` ou `sput-object {"x","y"}, ...`), qui n'existe
+# PAS en smali. En smali, les accolades { } ne sont légales que dans deux cas :
+#   1) juste après un opcode invoke-*  → une liste de registres, ex: {p0, v0}
+#   2) à l'intérieur d'un bloc .array-data / .end array-data
+# Toute autre paire d'accolades (notamment contenant des guillemets, des
+# nombres flottants ou des virgules hors invoke-*) est presque toujours une
+# hallucination de syntaxe Java par l'IA, qui casse la compilation apktool
+# beaucoup plus tard avec un message cryptique ("no viable alternative at
+# input '{'"). On le détecte ici, tout de suite, pour renvoyer un message
+# clair à l'IA qui pourra se corriger elle-même au lieu de relancer un build
+# complet pour rien.
+_SMALI_INVOKE_RE = re.compile(r'\b(invoke-[a-z/-]+(?:/range)?)\s*\{')
+_SMALI_BRACE_RE  = re.compile(r'\{[^{}]*\}')
+
+def _smali_quick_check(rel_path, content):
+    if not rel_path.endswith('.smali'):
+        return None
+    errors = []
+
+    # 1) Équilibre global des accolades / parenthèses.
+    if content.count('{') != content.count('}'):
+        errors.append("Accolades déséquilibrées ({ et } ne sont pas en nombre égal).")
+
+    # 2) Chaque paire d'accolades doit soit suivre un opcode invoke-*, soit
+    #    être une liste de registres/pseudo-registres (v0, p1, ...), soit
+    #    apparaître dans un bloc .array-data.
+    in_array_data = False
+    for lineno, raw in enumerate(content.splitlines(), start=1):
+        line = raw.split('#', 1)[0]  # ignore les commentaires
+        stripped = line.strip()
+        if stripped.startswith('.array-data'):
+            in_array_data = True
+            continue
+        if stripped.startswith('.end array-data'):
+            in_array_data = False
+            continue
+        if in_array_data or '{' not in line:
+            continue
+        # Détecte les accolades doublées/imbriquées (ex: `{{p0, v0}}`) —
+        # séquelle fréquente de l'IA qui recopie par erreur l'échappement
+        # `{{ }}` des f-strings Python vues dans server.py. La regex
+        # ci-dessous ne matche que la paire la PLUS INTERNE ; des accolades
+        # collées les unes aux autres passent donc inaperçues si on ne les
+        # vérifie pas explicitement ici.
+        if '{{' in line or '}}' in line:
+            errors.append(
+                f"Ligne {lineno}: accolades doublées détectées (`{{{{` ou `}}}}`) : "
+                f"`{stripped}`. En smali réel il ne faut JAMAIS doubler les accolades "
+                "(pas d'échappement façon f-string Python) — une seule paire, ex: "
+                "invoke-virtual {p0, v0}, ..."
+            )
+            continue
+        for m in _SMALI_BRACE_RE.finditer(line):
+            brace_content = m.group(0)
+            before = line[:m.start()].rstrip()
+            is_after_invoke = bool(_SMALI_INVOKE_RE.search(before + '{'))
+            looks_like_reg_list = re.fullmatch(
+                r'\{\s*(?:[vp]\d+\s*(?:,\s*[vp]\d+\s*)*)?\}', brace_content
+            ) is not None
+            if not is_after_invoke and not looks_like_reg_list:
+                errors.append(
+                    f"Ligne {lineno}: syntaxe d'accolades invalide en smali : `{brace_content.strip()}`. "
+                    "Les accolades ne sont autorisées qu'immédiatement après un opcode invoke-* "
+                    "(liste de registres, ex: invoke-static {v0, v1}, ...) ou dans un bloc "
+                    ".array-data / .end array-data. Un littéral de tableau façon Java "
+                    "(ex: {\"a\", \"b\"}) n'existe PAS en smali — utilise filled-new-array + "
+                    "move-result-object pour un petit tableau fixe, ou un bloc "
+                    ".array-data pour des données constantes."
+                )
+    return errors or None
 
 def write_binary_safe(sid, rel_path, data_bytes):
     sdir, target = _safe_target(sid, rel_path)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(data_bytes)
+    _snapshot_history(sid, rel_path, data_bytes)
 
 def read_binary_raw(sid, rel_path):
     sdir, target = _safe_target(sid, rel_path)
@@ -1193,7 +1645,27 @@ def replace_in_file_line(sid, rel_path, line_no, old_text, new_text):
     if old_text is not None and lines[idx].strip() != old_text.strip():
         raise ValueError("Le contenu de la ligne a changé depuis le scan — relancez une recherche.")
     lines[idx] = new_text
-    target.write_text("\n".join(lines), encoding="utf-8")
+    new_content = "\n".join(lines)
+    # Même garde-fou que write_file_safe : replace_line était le seul chemin
+    # d'écriture smali qui ne passait PAS par _smali_quick_check, ce qui
+    # laissait passer une ligne du style d'un littéral de tableau Java
+    # (ex: `{"a","b"}`) directement dans MainActivity.smali et ne cassait la
+    # compilation apktool que bien plus tard, avec un message cryptique.
+    if str(rel_path).endswith('.smali'):
+        smali_errors = _smali_quick_check(rel_path, new_content)
+        if smali_errors:
+            raise ValueError(
+                "Syntaxe smali invalide (ligne " + str(line_no) + " de '" + str(rel_path)
+                + "') — fichier NON modifié :\n- " + "\n- ".join(smali_errors)
+            )
+    if str(rel_path).endswith(('.java', '.kt')) and _session_origin(sid) not in _GRADLE_JAVA_ORIGINS:
+        raise ValueError(
+            "Fichier NON modifié : '" + str(rel_path) + "' — ce type de projet compile uniquement via "
+            "apktool sur du smali, aucun compilateur Java/Kotlin disponible ici. Édite le .smali existant "
+            "à la place."
+        )
+    target.write_text(new_content, encoding="utf-8")
+    _snapshot_history(sid, rel_path, new_content.encode("utf-8"))
 
 
 # =============================================================
@@ -1529,6 +2001,13 @@ def create_scratch_session(config, icon_bytes, splash_bytes, site_zip_bytes, log
     mode         = config.get("mode", "url")         # url | html | sitezip
     app_url      = (config.get("appUrl") or "").strip()
     html_inline  = config.get("htmlContent") or ""
+    # Plein écran : décoché par défaut dans le builder → l'app reste dans
+    # les limites normales de l'écran (barres système visibles).
+    fullscreen   = bool(config.get("fullscreen", False))
+    # Immersif : cache la barre de navigation (Retour/Accueil/Récents).
+    immersive    = bool(config.get("immersive", False))
+    # Screen pinning : verrouille l'app à l'écran (startLockTask()).
+    lock_task    = bool(config.get("lockTask", False))
 
     # Permissions
     default_perms = [
@@ -1575,13 +2054,16 @@ def create_scratch_session(config, icon_bytes, splash_bytes, site_zip_bytes, log
         wv_mode, wv_arg = "asset", ""
 
     (smali_pkg / "MainActivity.smali").write_text(
-        _smali_main(package, wv_arg, wv_mode, orientation, permissions=permissions), encoding="utf-8"
+        _smali_main(package, wv_arg, wv_mode, orientation, permissions=permissions, fullscreen=fullscreen, immersive=immersive, lock_task=lock_task), encoding="utf-8"
     )
     (smali_pkg / "InternalWebViewClient.smali").write_text(
         _smali_webviewclient(package), encoding="utf-8"
     )
     (smali_pkg / "InternalWebChromeClient.smali").write_text(
         _smali_webchromeclient(package), encoding="utf-8"
+    )
+    (smali_pkg / "InternalInsetsListener.smali").write_text(
+        _smali_insetslistener(package), encoding="utf-8"
     )
     logger.log(f"✅ Smali générés ({wv_mode})")
 
@@ -1695,6 +2177,18 @@ def decompile_to_session(template_bytes, logger):
             "Utilise le mode scratch (sans template) ou uploade un APK."
         )
 
+    # Support App Bundle (.aab) : converti automatiquement en APK universel
+    # via bundletool avant apktool, qui ne sait lire que des APK.
+    try:
+        with zipfile.ZipFile(template_path) as zf:
+            names = zf.namelist()
+            if any(n == "BundleConfig.pb" or n.startswith("base/") for n in names):
+                logger.log("ℹ App Bundle (.aab) détecté — conversion en APK universel...")
+                universal = convert_aab_to_universal_apk(template_path, sd, logger)
+                template_path = universal
+    except zipfile.BadZipFile:
+        pass  # laissé à apktool, qui donnera un message d'échec cohérent plus bas
+
     java    = find_tool("java")
     apktool = find_tool("apktool")
     if not java:    raise RuntimeError("Java non trouvé — installe Java JDK")
@@ -1763,6 +2257,13 @@ def apply_config(sid, config, icon_bytes, splash_bytes, site_zip_bytes, logger):
     mode         = config.get("mode", "url")
     app_url      = (config.get("appUrl") or "").strip()
     html_inline  = config.get("htmlContent") or ""
+    # Plein écran : décoché par défaut dans le builder → l'app reste dans
+    # les limites normales de l'écran (barres système visibles).
+    fullscreen   = bool(config.get("fullscreen", False))
+    # Immersif : cache la barre de navigation (Retour/Accueil/Récents).
+    immersive    = bool(config.get("immersive", False))
+    # Screen pinning : verrouille l'app à l'écran (startLockTask()).
+    lock_task    = bool(config.get("lockTask", False))
 
     selected_perms = config.get("permissions", [])
     extra_perms    = parse_custom_permissions(config.get("customPermissions", ""))
@@ -1799,7 +2300,7 @@ def apply_config(sid, config, icon_bytes, splash_bytes, site_zip_bytes, logger):
                 new_smali_pkg = src / "smali" / new_path
                 new_smali_pkg.mkdir(parents=True, exist_ok=True)
                 (new_smali_pkg / "MainActivity.smali").write_text(
-                    _smali_main(package_new, wv_arg, wv_mode, orientation, permissions=permissions),
+                    _smali_main(package_new, wv_arg, wv_mode, orientation, permissions=permissions, fullscreen=fullscreen, immersive=immersive, lock_task=lock_task),
                     encoding="utf-8"
                 )
                 (new_smali_pkg / "InternalWebViewClient.smali").write_text(
@@ -1807,6 +2308,9 @@ def apply_config(sid, config, icon_bytes, splash_bytes, site_zip_bytes, logger):
                 )
                 (new_smali_pkg / "InternalWebChromeClient.smali").write_text(
                     _smali_webchromeclient(package_new), encoding="utf-8"
+                )
+                (new_smali_pkg / "InternalInsetsListener.smali").write_text(
+                    _smali_insetslistener(package_new), encoding="utf-8"
                 )
                 meta["package"] = package_new
                 meta["packageOld"] = package_new
@@ -1822,7 +2326,7 @@ def apply_config(sid, config, icon_bytes, splash_bytes, site_zip_bytes, logger):
                 smali_pkg = src / "smali" / pkg_path
                 smali_pkg.mkdir(parents=True, exist_ok=True)
                 (smali_pkg / "MainActivity.smali").write_text(
-                    _smali_main(package_new or old_pkg, wv_arg, wv_mode, orientation, permissions=permissions),
+                    _smali_main(package_new or old_pkg, wv_arg, wv_mode, orientation, permissions=permissions, fullscreen=fullscreen, immersive=immersive, lock_task=lock_task),
                     encoding="utf-8"
                 )
                 # BUG-M02 — toujours régénérer InternalWebViewClient pour éviter un
@@ -1833,6 +2337,10 @@ def apply_config(sid, config, icon_bytes, splash_bytes, site_zip_bytes, logger):
                 # Idem pour InternalWebChromeClient (CRITIQUE #2) — toujours régénéré
                 (smali_pkg / "InternalWebChromeClient.smali").write_text(
                     _smali_webchromeclient(package_new or old_pkg), encoding="utf-8"
+                )
+                # Idem pour InternalInsetsListener (fix edge-to-edge Android 15)
+                (smali_pkg / "InternalInsetsListener.smali").write_text(
+                    _smali_insetslistener(package_new or old_pkg), encoding="utf-8"
                 )
 
         pkg_final = package_new or meta.get("package", "com.example.app")
@@ -1870,6 +2378,28 @@ def apply_config(sid, config, icon_bytes, splash_bytes, site_zip_bytes, logger):
         if not (xml_dir / "data_extraction_rules.xml").exists():
             (xml_dir / "data_extraction_rules.xml").write_text(_data_extraction_rules_xml(), encoding="utf-8")
 
+    elif origin in ("cordova", "flutter", "reactnative"):
+        # Session hybride — patch config.xml / pubspec.yaml+main.dart / App.js,
+        # au lieu du pipeline apktool (qui ne s'applique qu'aux APK décompilés).
+        proj_root = resolve_session_root(sid)
+        hybrid_kwargs = dict(
+            app_name=app_name, package_new=package_new, version_code=version_code,
+            version_name=version_name, min_sdk=min_sdk, orientation=orientation,
+            mode=mode, app_url=app_url, html_inline=html_inline,
+            site_zip_bytes=site_zip_bytes, icon_bytes=icon_bytes, splash_bytes=splash_bytes,
+            permissions=permissions, logger=logger,
+        )
+        if origin == "cordova":
+            _apply_config_cordova(proj_root, **hybrid_kwargs)
+        elif origin == "flutter":
+            _apply_config_flutter(proj_root, **hybrid_kwargs)
+        else:
+            _apply_config_reactnative(proj_root, **hybrid_kwargs)
+        meta["package"] = package_new or meta.get("package", "")
+        meta["appName"] = app_name
+        meta_f.write_text(json.dumps(meta), encoding="utf-8")
+        return
+
     else:
         # Session décompilée — comportement classique (patch fichiers)
         _apply_config_decompiled(sid, src, config, icon_bytes, splash_bytes, site_zip_bytes, logger,
@@ -1903,6 +2433,276 @@ def apply_config(sid, config, icon_bytes, splash_bytes, site_zip_bytes, logger):
 
     meta["appName"] = app_name
     meta_f.write_text(json.dumps(meta), encoding="utf-8")
+
+
+def _hybrid_extract_sitezip(www_dir, site_zip_bytes, tmp_zip_path, logger):
+    """Extraction commune Cordova/Flutter/RN : dézippe dans www_dir, remonte
+    d'un niveau si tout est dans un unique sous-dossier (mêmes conventions
+    que generate_*_project)."""
+    if www_dir.exists():
+        shutil.rmtree(www_dir)
+    www_dir.mkdir(parents=True)
+    tmp_zip_path.write_bytes(site_zip_bytes)
+    with zipfile.ZipFile(tmp_zip_path) as zf:
+        _safe_extract_zip(zf, www_dir, logger)
+    children = list(www_dir.iterdir())
+    if len(children) == 1 and children[0].is_dir() and not (www_dir / "index.html").exists():
+        inner = children[0]
+        for item in inner.iterdir():
+            shutil.move(str(item), str(www_dir / item.name))
+        inner.rmdir()
+    tmp_zip_path.unlink(missing_ok=True)
+    if not (www_dir / "index.html").exists():
+        raise RuntimeError("Pas d'index.html trouvé à la racine du zip fourni (ni dans un unique sous-dossier).")
+
+
+def _apply_config_cordova(proj, app_name, package_new, version_code, version_name,
+                           min_sdk, orientation, mode, app_url, html_inline,
+                           site_zip_bytes, icon_bytes, splash_bytes, permissions, logger):
+    """Patch d'un projet Cordova existant (config.xml + www/) — pas de
+    régénération via `cordova create`, juste une réécriture des fichiers
+    déclaratifs ; `cordova build` relit config.xml à chaque compilation."""
+    config_xml_path = proj / "config.xml"
+    if not config_xml_path.exists():
+        raise RuntimeError("config.xml introuvable dans le projet Cordova — projet corrompu ou incomplet.")
+
+    existing = config_xml_path.read_text(encoding="utf-8")
+    m = re.search(r'widget[^>]*\bid="([^"]*)"', existing)
+    old_package = m.group(1) if m else "com.example.cordova"
+    package = package_new or old_package
+
+    icon_lines = ""
+    if icon_bytes:
+        icon_lines = "\n".join(
+            f'        <icon density="{d}" src="res/icon/android/icon-{d}.png" />'
+            for d in CORDOVA_ICON_DENSITIES
+        )
+        _cordova_write_icons(proj, icon_bytes, logger)
+    else:
+        # Conserve les balises <icon> existantes si aucune nouvelle icône n'est fournie
+        found = re.findall(r'^\s*<icon[^>]*/>\s*$', existing, flags=re.MULTILINE)
+        icon_lines = "\n".join(found)
+
+    splash_lines = ""
+    if splash_bytes:
+        splash_lines = "\n".join(
+            f'        <splash density="{d}" src="res/screen/android/screen-{d}.png" />'
+            for d in CORDOVA_SPLASH_DENSITIES
+        )
+        _cordova_write_splash(proj, splash_bytes, logger)
+    else:
+        # Conserve les balises <splash> existantes si aucun nouveau splash n'est fourni
+        found = re.findall(r'^\s*<splash[^>]*/>\s*$', existing, flags=re.MULTILINE)
+        splash_lines = "\n".join(found)
+
+    perm_lines = "\n".join(
+        f'        <uses-permission android:name="{p}" />'
+        for p in permissions if p != "android.permission.INTERNET"  # déjà implicite (access origin="*")
+    )
+    platform_extra = "\n".join(x for x in (icon_lines, splash_lines, perm_lines) if x)
+
+    config_xml = _cordova_config_xml(package, app_name, version_name, min_sdk, orientation, platform_extra)
+    config_xml_path.write_text(config_xml, encoding="utf-8")
+    logger.log("✅ config.xml patché (identité + permissions)")
+
+    www_dir = proj / "www"
+    if mode == "html" and html_inline:
+        www_dir.mkdir(parents=True, exist_ok=True)
+        (www_dir / "index.html").write_text(html_inline, encoding="utf-8")
+        logger.log("✅ www/index.html mis à jour")
+    elif mode == "sitezip" and site_zip_bytes:
+        _hybrid_extract_sitezip(www_dir, site_zip_bytes, proj / "site_upload.zip", logger)
+        logger.log("✅ Site extrait dans www/")
+    elif mode == "url" and app_url:
+        # Cordova charge www/index.html localement ; en mode URL distante on
+        # remplace ce point d'entrée par une redirection vers l'URL.
+        www_dir.mkdir(parents=True, exist_ok=True)
+        (www_dir / "index.html").write_text(
+            f'<!DOCTYPE html><html><head><meta charset="utf-8">'
+            f'<script>location.replace({json.dumps(app_url)});</script></head><body></body></html>',
+            encoding="utf-8"
+        )
+        logger.log("✅ www/index.html mis à jour (redirection vers l'URL)")
+
+
+def _apply_config_flutter(proj, app_name, package_new, version_code, version_name,
+                           min_sdk, orientation, mode, app_url, html_inline,
+                           site_zip_bytes, icon_bytes, splash_bytes, permissions, logger):
+    """Patch d'un projet Flutter existant (pubspec.yaml + lib/main.dart +
+    AndroidManifest.xml) — renommer le package Dart/Gradle après coup étant
+    fragile (`flutter pub get` + refactor de dossiers), on ne touche
+    l'applicationId/package que s'il change réellement."""
+    pubspec_path = proj / "pubspec.yaml"
+    if not pubspec_path.exists():
+        raise RuntimeError("pubspec.yaml introuvable dans le projet Flutter — projet corrompu ou incomplet.")
+
+    pubspec = pubspec_path.read_text(encoding="utf-8")
+    pubspec = re.sub(r'^version:\s*.*$', f"version: {version_name}+{version_code}",
+                      pubspec, count=1, flags=re.MULTILINE)
+
+    www_dir = proj / "assets" / "www"
+    if mode == "sitezip" and site_zip_bytes:
+        _hybrid_extract_sitezip(www_dir, site_zip_bytes, proj / "site_upload.zip", logger)
+        asset_dirs = _flutter_collect_asset_dirs(www_dir)
+        assets_yaml = "".join(f"    - {d}\n" for d in asset_dirs)
+        if re.search(r'^\s*assets:\s*$', pubspec, flags=re.MULTILINE):
+            pubspec = re.sub(r'(^\s*assets:\s*\n)(?:^\s*-.*\n)*', r'\1' + assets_yaml, pubspec, count=1, flags=re.MULTILINE)
+        elif "uses-material-design: true" in pubspec:
+            pubspec = pubspec.replace("uses-material-design: true",
+                                       "uses-material-design: true\n\n  assets:\n" + assets_yaml, 1)
+        else:
+            pubspec += "\nflutter:\n  assets:\n" + assets_yaml
+        logger.log(f"✅ Site extrait dans assets/www/ ({len(asset_dirs)} dossier(s) déclaré(s) dans pubspec.yaml)")
+    elif mode == "html" and html_inline:
+        www_dir.mkdir(parents=True, exist_ok=True)
+        (www_dir / "index.html").write_text(html_inline, encoding="utf-8")
+        if not re.search(r'assets/www/', pubspec):
+            if "uses-material-design: true" in pubspec:
+                pubspec = pubspec.replace("uses-material-design: true",
+                                           "uses-material-design: true\n\n  assets:\n    - assets/www/\n", 1)
+            else:
+                pubspec += "\nflutter:\n  assets:\n    - assets/www/\n"
+        logger.log("✅ assets/www/index.html mis à jour")
+
+    pubspec_path.write_text(pubspec, encoding="utf-8")
+    logger.log("✅ pubspec.yaml patché (version" + (" + assets" if mode in ("sitezip", "html") else "") + ")")
+
+    main_dart_path = proj / "lib" / "main.dart"
+    if main_dart_path.exists():
+        main_dart = main_dart_path.read_text(encoding="utf-8")
+        if mode in ("sitezip", "html"):
+            new_call = "..loadFlutterAsset('assets/www/index.html')"
+        else:
+            new_call = f"..loadRequest(Uri.parse({json.dumps(app_url or 'https://example.com')}))"
+        main_dart = re.sub(
+            r'\.\.(loadFlutterAsset|loadRequest)\([^;]*\)',
+            new_call, main_dart, count=1
+        )
+        main_dart = re.sub(r'title:\s*[^,]*,', f'title: {json.dumps(app_name)},', main_dart, count=1)
+        main_dart_path.write_text(main_dart, encoding="utf-8")
+        logger.log("✅ lib/main.dart patché (source + titre)")
+
+    manifest_path = proj / "android" / "app" / "src" / "main" / "AndroidManifest.xml"
+    if manifest_path.exists():
+        manifest = manifest_path.read_text(encoding="utf-8")
+        manifest = re.sub(r'android:label="[^"]*"', f'android:label="{app_name}"', manifest, count=1)
+        for perm in permissions:
+            if perm not in manifest:
+                manifest = manifest.replace(
+                    "<application", f'<uses-permission android:name="{perm}" />\n    <application', 1
+                )
+        manifest_path.write_text(manifest, encoding="utf-8")
+        logger.log("✅ AndroidManifest.xml patché (label + permissions)")
+
+    build_gradle_path = proj / "android" / "app" / "build.gradle"
+    if not build_gradle_path.exists():
+        build_gradle_path = proj / "android" / "app" / "build.gradle.kts"
+    if build_gradle_path.exists() and package_new:
+        content = build_gradle_path.read_text(encoding="utf-8")
+        content = re.sub(r'applicationId\s*=?\s*"[^"]*"', f'applicationId "{package_new}"', content, count=1)
+        build_gradle_path.write_text(content, encoding="utf-8")
+        logger.log("⚠ applicationId mis à jour dans build.gradle — le renommage complet des dossiers "
+                    "Kotlin/Java (com/example/...) n'est PAS effectué automatiquement pour un projet Flutter "
+                    "existant ; édite MainActivity.kt manuellement si le build échoue après changement de package.")
+
+    if icon_bytes:
+        res_dir = proj / "android" / "app" / "src" / "main" / "res"
+        written = 0
+        for density_dir, size in FLUTTER_ICON_DENSITIES.items():
+            target_dir = res_dir / density_dir
+            target_dir.mkdir(parents=True, exist_ok=True)
+            png = make_icon_png(icon_bytes, size)
+            (target_dir / "ic_launcher.png").write_bytes(png)
+            written += 1
+        logger.log(f"✅ Icônes mises à jour ({written} densités)")
+
+    if splash_bytes:
+        _flutter_write_splash(proj, splash_bytes, logger)
+
+
+def _apply_config_reactnative(proj, app_name, package_new, version_code, version_name,
+                               min_sdk, orientation, mode, app_url, html_inline,
+                               site_zip_bytes, icon_bytes, splash_bytes, permissions, logger):
+    """Patch d'un projet React Native existant (App.tsx/App.js + strings.xml
+    + build.gradle) — comme pour Flutter, le renommage du package Java après
+    `react-native init` n'est pas automatisé (dossiers com/example/... à
+    déplacer manuellement)."""
+    entry = proj / "App.tsx"
+    if not entry.exists():
+        entry = proj / "App.js"
+    if not entry.exists():
+        raise RuntimeError("App.tsx/App.js introuvable dans le projet React Native — projet corrompu ou incomplet.")
+
+    assets_www = proj / "android" / "app" / "src" / "main" / "assets" / "www"
+    if mode == "sitezip" and site_zip_bytes:
+        _hybrid_extract_sitezip(assets_www, site_zip_bytes, proj / "site_upload.zip", logger)
+        logger.log("✅ Site extrait dans android/app/src/main/assets/www/")
+    elif mode == "html" and html_inline:
+        assets_www.mkdir(parents=True, exist_ok=True)
+        (assets_www / "index.html").write_text(html_inline, encoding="utf-8")
+        logger.log("✅ assets/www/index.html mis à jour")
+
+    if mode in ("sitezip", "html"):
+        webview_source = "{{ uri: 'file:///android_asset/www/index.html' }}"
+    else:
+        webview_source = f"{{{{ uri: {json.dumps(app_url or 'https://example.com')} }}}}"
+
+    app_source = entry.read_text(encoding="utf-8")
+    app_source = re.sub(r"source=\{\{[^}]*\}\}", f"source={webview_source}", app_source, count=1)
+    entry.write_text(app_source, encoding="utf-8")
+    logger.log(f"✅ {entry.name} patché (source WebView)")
+
+    strings_path = proj / "android" / "app" / "src" / "main" / "res" / "values" / "strings.xml"
+    if strings_path.exists():
+        content = strings_path.read_text(encoding="utf-8")
+        content = re.sub(r'(<string name="app_name">)[^<]*(</string>)', rf'\1{app_name}\2', content, count=1)
+        strings_path.write_text(content, encoding="utf-8")
+        logger.log("✅ strings.xml patché (app_name)")
+
+    build_gradle_path = proj / "android" / "app" / "build.gradle"
+    if build_gradle_path.exists():
+        content = build_gradle_path.read_text(encoding="utf-8")
+        content = re.sub(r'versionCode\s+\d+', f'versionCode {version_code}', content, count=1)
+        content = re.sub(r'versionName\s*"[^"]*"', f'versionName "{version_name}"', content, count=1)
+        if package_new:
+            content = re.sub(r'applicationId\s+"[^"]*"', f'applicationId "{package_new}"', content, count=1)
+            logger.log("⚠ applicationId mis à jour dans build.gradle — le renommage complet des dossiers "
+                        "Java (com/example/...) n'est PAS effectué automatiquement ; édite MainActivity.java "
+                        "manuellement si le build échoue après changement de package.")
+        build_gradle_path.write_text(content, encoding="utf-8")
+        logger.log("✅ build.gradle patché (version)")
+
+    manifest_path = proj / "android" / "app" / "src" / "main" / "AndroidManifest.xml"
+    if manifest_path.exists():
+        manifest = manifest_path.read_text(encoding="utf-8")
+        changed = False
+        for perm in permissions:
+            if perm not in manifest:
+                manifest = manifest.replace(
+                    "<application", f'<uses-permission android:name="{perm}" />\n    <application', 1
+                )
+                changed = True
+        if changed:
+            manifest_path.write_text(manifest, encoding="utf-8")
+            logger.log("✅ AndroidManifest.xml patché (permissions)")
+
+    if icon_bytes:
+        anydpi_dir = proj / "android" / "app" / "src" / "main" / "res" / "mipmap-anydpi-v26"
+        if anydpi_dir.exists():
+            shutil.rmtree(anydpi_dir)
+        res_dir = proj / "android" / "app" / "src" / "main" / "res"
+        written = 0
+        for density_dir, size in RN_ICON_DENSITIES.items():
+            target_dir = res_dir / density_dir
+            target_dir.mkdir(parents=True, exist_ok=True)
+            png = make_icon_png(icon_bytes, size)
+            (target_dir / "ic_launcher.png").write_bytes(png)
+            (target_dir / "ic_launcher_round.png").write_bytes(png)
+            written += 1
+        logger.log(f"✅ Icônes mises à jour ({written} densités, icône adaptative désactivée)")
+
+    if splash_bytes:
+        _rn_write_splash(proj, splash_bytes, logger)
 
 
 def _apply_config_decompiled(sid, src, config, icon_bytes, splash_bytes, site_zip_bytes, logger,
@@ -2142,8 +2942,86 @@ def _apply_config_decompiled(sid, src, config, icon_bytes, splash_bytes, site_zi
 # =============================================================
 # RECOMPILATION + SIGNATURE
 # =============================================================
+def _detect_min_sdk_from_gradle(android_dir, default):
+    """Relit minSdkVersion/minSdk depuis app/build.gradle d'un projet
+    natif déjà généré (Cordova/RN) ou le module android/ d'un projet
+    Flutter — sert à retrouver la valeur au moment du recompile, où le
+    bouton générique 'Compiler' de l'explorer ne renvoie que
+    {signing, outName} (pas le config complet passé à la génération)."""
+    try:
+        gradle_path = Path(android_dir) / "app" / "build.gradle"
+        if not gradle_path.exists():
+            gradle_path = Path(android_dir) / "build.gradle"
+        content = gradle_path.read_text(encoding="utf-8", errors="ignore")
+        m = re.search(r'minSdk(?:Version)?\s*[= ]?\s*(\d+)', content)
+        if m:
+            return int(m.group(1))
+    except Exception:
+        pass
+    return default
+
+
+def _recompile_hybrid_session(sid, origin, signing, out_name, logger):
+    """Recompile une session Cordova/Flutter/React Native déjà générée
+    (et potentiellement éditée à la main dans l'explorer) en réutilisant
+    EXACTEMENT le même pipeline que /build-cordova, /build-flutter,
+    /build-rn appelés avec {"session": sid} (run_gradle_build ou
+    run_flutter_build + sign_native_apk) — jamais apktool, qui ne
+    comprend rien à ces arborescences de projet natif/Gradle/Dart.
+    Appelé depuis recompile_session() dès que session.json indique une
+    origine hybride, pour que le bouton générique 'Compiler' fonctionne
+    aussi sur ces sessions (avant, il tentait apktool sur un dossier
+    'source'/'decompiled' qui n'existe pas pour ces origines et échouait)."""
+    logger.log(f"♻ Session hybride détectée (origin={origin}) — pipeline dédié (pas apktool).")
+
+    if origin == "cordova":
+        proj = cordova_project_dir(sid)
+        if not proj.exists():
+            raise RuntimeError(f"Session {sid} : dossier cordova_project introuvable — régénère le projet Cordova.")
+        android_dir = proj / "platforms" / "android"
+        build_type = "assembleDebug" if (signing or {}).get("mode") == "debug" else "assembleRelease"
+        unsigned_apk = run_gradle_build(android_dir, logger, build_type)
+        min_sdk = _detect_min_sdk_from_gradle(android_dir, CORDOVA_MIN_SDK_DEFAULT)
+        return sign_native_apk(unsigned_apk, signing, android_dir, out_name, min_sdk, logger)
+
+    if origin == "flutter":
+        proj = flutter_project_dir(sid)
+        if not proj.exists():
+            raise RuntimeError(f"Session {sid} : dossier flutter_project introuvable — régénère le projet Flutter.")
+        build_type = "debug" if (signing or {}).get("mode") == "debug" else "release"
+        unsigned_apk = run_flutter_build(proj, logger, build_type)
+        min_sdk = _detect_min_sdk_from_gradle(proj / "android", FLUTTER_MIN_SDK_DEFAULT)
+        return sign_native_apk(unsigned_apk, signing, proj, out_name, min_sdk, logger)
+
+    if origin == "reactnative":
+        proj = react_native_project_dir(sid)
+        if not proj.exists():
+            raise RuntimeError(f"Session {sid} : dossier rn_project introuvable — régénère le projet React Native.")
+        android_dir = proj / "android"
+        unsigned_apk = run_gradle_build(android_dir, logger, "assembleRelease")
+        min_sdk = _detect_min_sdk_from_gradle(android_dir, NATIVE_MIN_SDK_DEFAULT)
+        return sign_native_apk(unsigned_apk, signing, android_dir, out_name, min_sdk, logger)
+
+    raise RuntimeError(f"Origine hybride inconnue : {origin}")
+
+
 def recompile_session(sid, signing, out_name, logger):
     sd = session_dir(sid)
+
+    # BUG — le bouton 'Compiler' (générique) tentait apktool même sur les
+    # sessions Cordova/Flutter/React Native, dont le dossier "source"/
+    # "decompiled" n'existe jamais (elles vivent dans cordova_project/
+    # flutter_project/rn_project) → échec systématique. On lit l'origine
+    # dans session.json et on délègue au pipeline natif correspondant.
+    meta_path = sd / "session.json"
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            origin = meta.get("origin", "")
+            if origin in ("cordova", "flutter", "reactnative"):
+                return _recompile_hybrid_session(sid, origin, signing, out_name, logger)
+        except Exception as e:
+            logger.log(f"⚠ Lecture session.json échouée ({e}) — tentative de compilation apktool par défaut.")
 
     # Détermine le dossier source
     sdir_v3 = source_dir(sid)
@@ -2516,6 +3394,2432 @@ def run_device_test(apk_path, package_name, logger, serial=None):
 
 
 # =============================================================
+# PIPELINE NATIF (Gradle / Kotlin) — génération d'apps compilées
+# from scratch, à côté du pipeline WebView/smali existant ci-dessous.
+# N'affecte AUCUNE fonction existante — module 100% additif.
+# =============================================================
+NATIVE_MIN_SDK_DEFAULT     = 24
+NATIVE_TARGET_SDK_DEFAULT  = 34
+NATIVE_COMPILE_SDK_DEFAULT = 34
+NATIVE_BUILD_TOOLS_VERSION = "34.0.0"
+NATIVE_AGP_VERSION         = "8.3.2"
+NATIVE_KOTLIN_VERSION      = "1.9.23"
+
+def native_project_dir(sid):
+    return WORK_DIR / sid / "native_project"
+
+def generate_native_project(sid, config, logger):
+    """
+    Génère un projet Gradle Android minimal et réellement compilable
+    (Kotlin natif — pas de WebView). Template 'empty_activity' : une seule
+    Activity + un layout. Base extensible : d'autres templates pourront
+    s'ajouter plus tard sans changer la structure de cette fonction.
+    """
+    app_name     = (config.get("appName") or "MyNativeApp").strip()
+    package      = normalize_package_name(config.get("packageName"), fallback="com.example.nativeapp")
+    version_code = str(config.get("versionCode") or "1")
+    version_name = str(config.get("versionName") or "1.0")
+    min_sdk      = str(config.get("minSdk") or NATIVE_MIN_SDK_DEFAULT)
+    target_sdk   = str(config.get("targetSdk") or NATIVE_TARGET_SDK_DEFAULT)
+
+    proj = native_project_dir(sid)
+    if proj.exists():
+        shutil.rmtree(proj)
+    app_dir = proj / "app"
+    pkg_path = package.replace(".", "/")
+    kotlin_dir = app_dir / "src" / "main" / "kotlin" / pkg_path
+    res_dir = app_dir / "src" / "main" / "res"
+    kotlin_dir.mkdir(parents=True, exist_ok=True)
+    (res_dir / "layout").mkdir(parents=True, exist_ok=True)
+    (res_dir / "values").mkdir(parents=True, exist_ok=True)
+
+    logger.log(f"📁 Génération du projet natif : {package} ({app_name})")
+
+    (proj / "settings.gradle").write_text(
+        'pluginManagement {\n'
+        '    repositories {\n'
+        '        google()\n'
+        '        mavenCentral()\n'
+        '        gradlePluginPortal()\n'
+        '    }\n'
+        '}\n'
+        'dependencyResolutionManagement {\n'
+        '    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)\n'
+        '    repositories {\n'
+        '        google()\n'
+        '        mavenCentral()\n'
+        '    }\n'
+        '}\n'
+        f'rootProject.name = "{app_name}"\n'
+        'include(":app")\n',
+        encoding="utf-8"
+    )
+
+    (proj / "build.gradle").write_text(
+        'plugins {\n'
+        f'    id("com.android.application") version "{NATIVE_AGP_VERSION}" apply false\n'
+        f'    id("org.jetbrains.kotlin.android") version "{NATIVE_KOTLIN_VERSION}" apply false\n'
+        '}\n',
+        encoding="utf-8"
+    )
+
+    (proj / "gradle.properties").write_text(
+        "org.gradle.jvmargs=-Xmx2048m\n"
+        "android.useAndroidX=true\n"
+        "kotlin.code.style=official\n",
+        encoding="utf-8"
+    )
+
+    # local.properties : chemin du SDK, forward-slashes (compatible Windows,
+    # évite les soucis d'échappement de backslash dans un fichier .properties)
+    sdk_path_str = str(SDK_DIR.resolve()).replace("\\", "/")
+    (proj / "local.properties").write_text(f"sdk.dir={sdk_path_str}\n", encoding="utf-8")
+
+    (app_dir / "build.gradle").write_text(
+        'plugins {\n'
+        '    id("com.android.application")\n'
+        '    id("org.jetbrains.kotlin.android")\n'
+        '}\n\n'
+        'android {\n'
+        f'    namespace "{package}"\n'
+        f'    compileSdk {NATIVE_COMPILE_SDK_DEFAULT}\n'
+        f'    buildToolsVersion "{NATIVE_BUILD_TOOLS_VERSION}"\n\n'
+        '    defaultConfig {\n'
+        f'        applicationId "{package}"\n'
+        f'        minSdk {min_sdk}\n'
+        f'        targetSdk {target_sdk}\n'
+        f'        versionCode {version_code}\n'
+        f'        versionName "{version_name}"\n'
+        '    }\n\n'
+        '    buildTypes {\n'
+        '        release {\n'
+        '            minifyEnabled false\n'
+        '        }\n'
+        '    }\n\n'
+        '    compileOptions {\n'
+        '        sourceCompatibility JavaVersion.VERSION_17\n'
+        '        targetCompatibility JavaVersion.VERSION_17\n'
+        '    }\n'
+        '    kotlinOptions {\n'
+        '        jvmTarget = "17"\n'
+        '    }\n'
+        '}\n\n'
+        'dependencies {\n'
+        '    implementation "androidx.core:core-ktx:1.13.1"\n'
+        '    implementation "androidx.appcompat:appcompat:1.7.0"\n'
+        '    implementation "com.google.android.material:material:1.12.0"\n'
+        '}\n',
+        encoding="utf-8"
+    )
+
+    (app_dir / "src" / "main" / "AndroidManifest.xml").write_text(
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n'
+        '    <application\n'
+        '        android:label="@string/app_name"\n'
+        '        android:icon="@mipmap/ic_launcher"\n'
+        '        android:allowBackup="true"\n'
+        '        android:theme="@style/Theme.Native">\n'
+        '        <activity\n'
+        '            android:name=".MainActivity"\n'
+        '            android:exported="true">\n'
+        '            <intent-filter>\n'
+        '                <action android:name="android.intent.action.MAIN" />\n'
+        '                <category android:name="android.intent.category.LAUNCHER" />\n'
+        '            </intent-filter>\n'
+        '        </activity>\n'
+        '    </application>\n'
+        '</manifest>\n',
+        encoding="utf-8"
+    )
+
+    (kotlin_dir / "MainActivity.kt").write_text(
+        f'package {package}\n\n'
+        'import android.os.Bundle\n'
+        'import androidx.appcompat.app.AppCompatActivity\n\n'
+        'class MainActivity : AppCompatActivity() {\n'
+        '    override fun onCreate(savedInstanceState: Bundle?) {\n'
+        '        super.onCreate(savedInstanceState)\n'
+        '        setContentView(R.layout.activity_main)\n'
+        '    }\n'
+        '}\n',
+        encoding="utf-8"
+    )
+
+    (res_dir / "layout" / "activity_main.xml").write_text(
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"\n'
+        '    android:layout_width="match_parent"\n'
+        '    android:layout_height="match_parent"\n'
+        '    android:orientation="vertical"\n'
+        '    android:gravity="center">\n'
+        '    <TextView\n'
+        '        android:layout_width="wrap_content"\n'
+        '        android:layout_height="wrap_content"\n'
+        '        android:textSize="20sp"\n'
+        '        android:text="@string/app_name" />\n'
+        '</LinearLayout>\n',
+        encoding="utf-8"
+    )
+
+    (res_dir / "values" / "strings.xml").write_text(
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<resources>\n'
+        f'    <string name="app_name">{xml_escape_text(app_name)}</string>\n'
+        '</resources>\n',
+        encoding="utf-8"
+    )
+
+    (res_dir / "values" / "themes.xml").write_text(
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<resources>\n'
+        '    <style name="Theme.Native" parent="Theme.MaterialComponents.DayNight.NoActionBar" />\n'
+        '</resources>\n',
+        encoding="utf-8"
+    )
+
+    # Icônes : PNG classiques (pas d'adaptive-icon XML pour rester simple),
+    # réutilise make_icon_png déjà utilisé par le pipeline WebView.
+    icon_bytes = config.get("_iconBytes")
+    for density_dir, size in (("mipmap-mdpi", 48), ("mipmap-hdpi", 72), ("mipmap-xhdpi", 96),
+                               ("mipmap-xxhdpi", 144), ("mipmap-xxxhdpi", 192)):
+        d = res_dir / density_dir
+        d.mkdir(parents=True, exist_ok=True)
+        try:
+            png = make_icon_png(icon_bytes, size) if icon_bytes else _make_solid_png(size, size)
+        except Exception:
+            png = _make_solid_png(size, size)
+        (d / "ic_launcher.png").write_bytes(png)
+
+    logger.log("✅ Structure du projet natif générée.")
+    return proj
+
+
+def _native_gradle_env(logger):
+    """
+    Construit l'environnement (PATH/JAVA_HOME) pour lancer Gradle avec le
+    JDK téléchargé par setup.js si présent, sinon le Java système détecté
+    par find_tool (même logique que le reste du serveur).
+    """
+    env = os.environ.copy()
+    jdk_dir = TOOLS_DIR / "jdk"
+    java_home = None
+    if (jdk_dir / "bin" / "java.exe").exists():
+        java_home = jdk_dir
+    else:
+        java_path = find_tool("java")
+        if java_path:
+            # remonte de tools/jdk-x/bin/java.exe → tools/jdk-x
+            java_home = Path(java_path).parent.parent
+    if java_home:
+        env["JAVA_HOME"] = str(java_home)
+        env["PATH"] = str(java_home / "bin") + os.pathsep + env.get("PATH", "")
+        logger.log(f"☕ JAVA_HOME = {java_home}")
+    else:
+        logger.log("⚠ JDK introuvable — le build Gradle risque d'échouer. Installe le composant 'jdk'.")
+    return env
+
+
+def find_gradle():
+    """Gradle téléchargé par setup.js en priorité, sinon Gradle système (PATH)."""
+    bundled = TOOLS_DIR / "gradle" / "bin" / ("gradle.bat" if os.name == "nt" else "gradle")
+    if bundled.exists():
+        return str(bundled)
+    return shutil.which("gradle")
+
+
+def find_jadx():
+    """jadx téléchargé par setup.js (tools/jadx/bin/jadx.bat) en priorité,
+    sinon jadx système (PATH)."""
+    bundled = TOOLS_DIR / "jadx" / "bin" / ("jadx.bat" if os.name == "nt" else "jadx")
+    if bundled.exists():
+        return str(bundled)
+    return shutil.which("jadx")
+
+
+def find_bundletool():
+    """bundletool.jar téléchargé par setup.js — pas d'exécutable natif,
+    toujours lancé via `java -jar`."""
+    bundled = TOOLS_DIR / "bundletool" / "bundletool.jar"
+    if bundled.exists():
+        return str(bundled)
+    return None
+
+
+def run_gradle_build(project_dir, logger, build_type="assembleRelease"):
+    """
+    Lance Gradle sur le projet généré et retourne le Path de l'APK produit
+    (non signé — la signature est faite séparément via sign_native_apk,
+    pour rester cohérent avec le pipeline WebView existant).
+    """
+    gradle = find_gradle()
+    if not gradle:
+        raise RuntimeError(
+            "Gradle introuvable. Installe le composant 'gradle' depuis "
+            "l'écran des composants avant de lancer un build natif."
+        )
+
+    # Pré-vérification android.jar (platforms;android-34) : sans ce fichier
+    # Gradle échoue toujours, mais avec un message générique et peu clair
+    # ("SDK location not found" ou une erreur de résolution de plugin très
+    # loin en aval). On le détecte ici pour donner un message actionnable
+    # tout de suite plutôt que de laisser l'utilisateur lire 200 lignes de
+    # stacktrace Gradle.
+    android_jar = SDK_DIR / "platforms" / f"android-{NATIVE_COMPILE_SDK_DEFAULT}" / "android.jar"
+    if not android_jar.exists():
+        raise RuntimeError(
+            f"platforms;android-{NATIVE_COMPILE_SDK_DEFAULT} absent du SDK "
+            f"({android_jar} introuvable). Installe/réinstalle le composant "
+            "'Android SDK (platform-tools + build-tools + platforms)' depuis "
+            "l'écran des composants — le build natif ne peut pas compiler sans "
+            "android.jar."
+        )
+
+    env = _native_gradle_env(logger)
+    logger.log(f"🔨 Compilation Gradle ({build_type})... (peut prendre plusieurs minutes la 1ère fois — téléchargement des dépendances Android)")
+    cmd = [gradle, build_type, "--no-daemon", "--console=plain", "-p", str(project_dir)]
+    logger.log(f"$ {' '.join(cmd)}")
+    try:
+        r = subprocess.run(cmd, cwd=str(project_dir), env=env, capture_output=True,
+                            text=True, encoding="utf-8", errors="replace", timeout=1800)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("Timeout Gradle (30 min dépassées) — build annulé.")
+    for line in (r.stdout or "").strip().split("\n"):
+        if line.strip(): logger.log(line)
+    for line in (r.stderr or "").strip().split("\n"):
+        if line.strip(): logger.log("⚠ " + line)
+    if r.returncode != 0:
+        raise RuntimeError("Échec de la compilation Gradle — voir les logs ci-dessus pour la cause exacte.")
+
+    variant = "release" if "Release" in build_type else "debug"
+    apk_dir = project_dir / "app" / "build" / "outputs" / "apk" / variant
+    candidates = list(apk_dir.glob("*.apk")) if apk_dir.exists() else []
+    if not candidates:
+        raise RuntimeError(f"Build Gradle terminé mais aucun APK trouvé dans {apk_dir}")
+    logger.log(f"✅ APK compilé : {candidates[0].name}")
+    return candidates[0]
+
+
+def sign_native_apk(unsigned_apk, signing, workdir, out_name, min_sdk, logger):
+    """
+    Aligne + signe un APK produit par Gradle. Copie volontairement le
+    même comportement que recompile_session (signature debug/custom,
+    repli jarsigner, vérification finale) sans toucher à cette dernière —
+    évite tout risque de régression sur le pipeline WebView existant.
+    """
+    workdir = Path(workdir)
+    aligned_apk = workdir / "aligned_native.apk"
+    zipalign = find_tool("zipalign")
+    if zipalign:
+        logger.log("🔧 Zipalign...")
+        aligned_apk.unlink(missing_ok=True)
+        ok_zip = run_cmd([zipalign, "-f", "-v", "4", str(unsigned_apk), str(aligned_apk)], logger)
+        if not ok_zip or not aligned_apk.exists() or aligned_apk.stat().st_size == 0:
+            logger.log("⚠ Zipalign a échoué — utilisation APK non aligné")
+            aligned_apk.unlink(missing_ok=True)
+            aligned_apk = Path(unsigned_apk)
+    else:
+        logger.log("⚠ zipalign non trouvé, étape sautée")
+        aligned_apk = Path(unsigned_apk)
+
+    final_apk = OUTPUT_DIR / out_name
+    signing_mode = (signing or {}).get("mode", "debug")
+
+    if signing_mode == "nosign":
+        shutil.copy(aligned_apk, final_apk)
+        logger.log(f"✅ APK natif compilé (non signé) : {final_apk.name}")
+        return final_apk
+
+    keystore = None
+    ks_pass  = "android"
+    key_pass = "android"
+    alias    = "androiddebugkey"
+    ks_is_pkcs12 = False
+
+    if signing_mode == "custom" and signing.get("keystoreB64"):
+        keystore = workdir / "custom_native.keystore"
+        keystore.write_bytes(base64.b64decode(signing["keystoreB64"]))
+        alias    = signing.get("alias")    or alias
+        ks_pass  = signing.get("storePass") or ks_pass
+        key_pass = signing.get("keyPass")   or ks_pass
+        try:
+            magic = keystore.read_bytes()[:4]
+            if magic[:2] == b'PK' or magic[0:1] == b'\x30':
+                ks_is_pkcs12 = True
+        except Exception:
+            pass
+        logger.log(f"🔑 Keystore personnalisé (alias: {alias}{'  PKCS12' if ks_is_pkcs12 else ''})")
+    else:
+        keystore = TOOLS_DIR / "debug.keystore"
+        logger.log("🔑 Keystore debug")
+
+    if not keystore or not keystore.exists():
+        raise RuntimeError(f"Keystore introuvable : {keystore}")
+
+    apksigner = find_tool("apksigner")
+    signed_ok = False
+
+    if apksigner and keystore.exists():
+        logger.log("✍ Signature avec apksigner...")
+        ks_pass_arg,  ks_pass_file  = _pass_arg(ks_pass,  workdir, "ks_native.pass.tmp")
+        key_pass_arg, key_pass_file = _pass_arg(key_pass, workdir, "key_native.pass.tmp")
+        min_sdk_int = int(min_sdk) if str(min_sdk).isdigit() else 23
+        enable_v4 = min_sdk_int >= 30
+        cmd = [apksigner, "sign",
+               "--ks", str(keystore),
+               "--ks-pass", ks_pass_arg, "--key-pass", key_pass_arg,
+               "--min-sdk-version", str(min_sdk_int),
+               "--v1-signing-enabled", "true",
+               "--v2-signing-enabled", "true",
+               "--v3-signing-enabled", "true",
+               *(["--ks-type", "PKCS12"] if ks_is_pkcs12 else []),
+               "--v4-signing-enabled", "true" if enable_v4 else "false"]
+        if alias: cmd += ["--ks-key-alias", alias]
+        cmd += ["--out", str(final_apk), str(aligned_apk)]
+        try:
+            signed_ok = run_cmd(cmd, logger)
+        finally:
+            for f in (ks_pass_file, key_pass_file):
+                try: f.unlink(missing_ok=True)
+                except: pass
+        if signed_ok and final_apk.exists():
+            _verify_signature_schemes(apksigner, final_apk, logger)
+
+    if not signed_ok:
+        jarsigner = find_tool("jarsigner")
+        if jarsigner and keystore.exists():
+            logger.log("✍ Tentative jarsigner...")
+            shutil.copy(aligned_apk, final_apk)
+            signed_ok = run_cmd([jarsigner, "-verbose", "-sigalg", "SHA1withRSA",
+                                  "-digestalg", "SHA1", "-keystore", str(keystore),
+                                  "-storepass", ks_pass, "-keypass", key_pass,
+                                  str(final_apk), alias], logger)
+
+    if not signed_ok:
+        raise RuntimeError("Aucun signeur trouvé (apksigner/jarsigner).")
+
+    try:
+        with zipfile.ZipFile(final_apk) as zf:
+            bad = zf.testzip()
+            if bad: raise RuntimeError(f"Entrée corrompue: {bad}")
+    except zipfile.BadZipFile:
+        final_apk.unlink(missing_ok=True)
+        raise RuntimeError("APK final corrompu. Relance.")
+
+    if signing_mode == "custom" and keystore.name == "custom_native.keystore":
+        try: keystore.unlink()
+        except: pass
+
+    logger.log(f"✅ APK natif prêt : {final_apk.name}")
+    return final_apk
+
+
+def do_build_native(config, icon_bytes):
+    """
+    Orchestration complète du build natif : génération projet → Gradle →
+    signature. Utilise son propre token OPS['native'] pour ne jamais
+    interférer avec OPS['legacy'] (pipeline WebView) — les deux peuvent
+    même tourner en parallèle sans se marcher dessus.
+    """
+    logger = OPS["native"] = OpLogger()
+    logger.lines = []; logger.status = "building"; logger.result_file = None
+    sid = new_session_id()
+    logger.session = sid
+    try:
+        if icon_bytes:
+            config["_iconBytes"] = icon_bytes
+        proj = generate_native_project(sid, config, logger)
+        build_type = "assembleDebug" if (config.get("signing", {}).get("mode") == "debug") else "assembleRelease"
+        unsigned_apk = run_gradle_build(proj, logger, build_type)
+
+        app_name     = (config.get("appName") or "MyNativeApp").strip()
+        version_name = str(config.get("versionName") or "1.0")
+        out_name = f"{re.sub(r'[^A-Za-z0-9_.-]', '_', app_name)}_{version_name}_native.apk"
+        min_sdk = config.get("minSdk") or NATIVE_MIN_SDK_DEFAULT
+        signing = config.get("signing", {"mode": "debug"})
+
+        final_apk = sign_native_apk(unsigned_apk, signing, proj, out_name, min_sdk, logger)
+        logger.result_file = str(final_apk)
+        logger.status = "done"
+    except Exception as e:
+        import traceback
+        logger.log(f"❌ Erreur: {e}")
+        logger.log(traceback.format_exc())
+        logger.status = "error"
+
+
+# =============================================================
+# PIPELINE TWA (Trusted Web Activity) — "site → app" via bubblewrap
+# ---------------------------------------------------------------
+# 3e famille de méthode : ni scratch WebView (smali), ni natif Kotlin
+# vide — ici on enveloppe un site web EXISTANT dans un vrai projet
+# Android généré par l'outil officiel Google (bubblewrap), qui produit
+# un vrai APK signable, avec Chrome Custom Tabs en fallback. Réutilise
+# le même sign_native_apk que le pipeline natif (--skipSigning côté
+# bubblewrap : on gère nous-mêmes zipalign+apksigner, ce qui évite les
+# soucis connus de mots de passe interactifs de bubblewrap build).
+# =============================================================
+TWA_MIN_SDK_DEFAULT = 21
+
+def find_bubblewrap():
+    """bubblewrap installé en npm-global par setup.js dans tools/nodejs/."""
+    bundled = TOOLS_DIR / "nodejs" / ("bubblewrap.cmd" if os.name == "nt" else "bubblewrap")
+    if bundled.exists():
+        return str(bundled)
+    return shutil.which("bubblewrap")
+
+
+def twa_project_dir(sid):
+    return WORK_DIR / sid / "twa_project"
+
+
+def _twa_env(logger):
+    """Même logique que _native_gradle_env : JDK téléchargé en priorité,
+    + ANDROID_HOME/ANDROID_SDK_ROOT pointés vers notre SDK déjà installé
+    (platform-tools/build-tools/platforms — cf. composant androidSdk)."""
+    env = _native_gradle_env(logger)
+    env["ANDROID_HOME"] = str(SDK_DIR)
+    env["ANDROID_SDK_ROOT"] = str(SDK_DIR)
+    return env
+
+
+def ensure_bubblewrap_config(logger):
+    """
+    bubblewrap stocke le chemin JDK/SDK dans ~/.bubblewrap/config.json et,
+    s'il est absent, lance un assistant interactif (bloquant en subprocess
+    non-TTY → timeout garanti). On l'écrit nous-mêmes via `updateConfig`
+    pour pointer vers le JDK et le SDK déjà téléchargés par setup.js,
+    donc jamais de première-exécution interactive.
+    """
+    bubblewrap = find_bubblewrap()
+    if not bubblewrap:
+        raise RuntimeError(
+            "bubblewrap introuvable. Installe le composant 'bubblewrap' depuis "
+            "l'écran des composants avant de générer un TWA."
+        )
+    jdk_dir = TOOLS_DIR / "jdk"
+    if not (jdk_dir / "bin" / "java.exe").exists():
+        raise RuntimeError("JDK introuvable — installe le composant 'jdk' avant de générer un TWA.")
+    if not SDK_DIR.exists():
+        raise RuntimeError("Android SDK introuvable — installe le composant 'androidSdk' avant de générer un TWA.")
+
+    env = _twa_env(logger)
+    logger.log("⚙ Configuration bubblewrap (JDK + Android SDK)...")
+    cmd = [bubblewrap, "updateConfig",
+           f"--jdkPath={jdk_dir.resolve()}",
+           f"--androidSdkPath={SDK_DIR.resolve()}"]
+    r = subprocess.run(cmd, env=env, capture_output=True, text=True,
+                        encoding="utf-8", errors="replace", timeout=60)
+    for line in (r.stdout or "").strip().split("\n"):
+        if line.strip(): logger.log(line)
+    if r.returncode != 0:
+        logger.log("⚠ bubblewrap updateConfig a retourné une erreur (souvent sans gravité, on continue) : " + (r.stderr or "")[:300])
+
+
+def generate_twa_manifest(sid, config, logger):
+    """
+    Écrit un twa-manifest.json valide directement (schéma documenté par
+    bubblewrap), donc pas besoin de passer par `bubblewrap init` qui est
+    interactif et qui télécharge le manifest web. L'utilisateur donne
+    juste l'URL du site + les métadonnées ; c'est ensuite `bubblewrap
+    update` (régénère le projet Android depuis ce json) puis `build`.
+    """
+    url = (config.get("url") or "").strip()
+    if not url or not url.startswith(("http://", "https://")):
+        raise RuntimeError("URL du site invalide ou manquante (doit commencer par http:// ou https://).")
+    parsed = urlparse(url)
+    host = parsed.netloc
+    if not host:
+        raise RuntimeError("Impossible d'extraire le domaine depuis l'URL fournie.")
+
+    package = normalize_package_name(config.get("packageName"), fallback="com.example.twa")
+    app_name = (config.get("appName") or "MonApp").strip()
+    theme_color = config.get("themeColor") or "#2196F3"
+    bg_color = config.get("backgroundColor") or "#FFFFFF"
+    start_url = config.get("startUrl") or (parsed.path or "/")
+    icon_url = (config.get("iconUrl") or "").strip()
+    if not icon_url:
+        raise RuntimeError(
+            "iconUrl requis : bubblewrap télécharge l'icône depuis une URL publique "
+            "(icône hébergée sur ton site, 512x512 px minimum) — pas d'upload local possible pour ce mode."
+        )
+
+    proj = twa_project_dir(sid)
+    if proj.exists():
+        shutil.rmtree(proj)
+    proj.mkdir(parents=True, exist_ok=True)
+
+    manifest = {
+        "packageId": package,
+        "host": host,
+        "name": app_name,
+        "launcherName": app_name[:30],
+        "display": "standalone",
+        "themeColor": theme_color,
+        "navigationColor": theme_color,
+        "navigationColorDark": "#000000",
+        "backgroundColor": bg_color,
+        "backgroundColorDark": "#000000",
+        "enableNotifications": bool(config.get("enableNotifications")),
+        "startUrl": start_url,
+        "iconUrl": icon_url,
+        "maskableIconUrl": config.get("maskableIconUrl") or "",
+        "monochromeIconUrl": "",
+        "splashScreenFadeOutDuration": 300,
+        "signingKey": {"path": "", "alias": ""},  # non utilisé : --skipSigning
+        "appVersionName": str(config.get("versionName") or "1.0"),
+        "appVersionCode": int(str(config.get("versionCode") or "1")),
+        "shortcuts": [],
+        "generatorApp": "APKFactoryPro",
+        "webManifestUrl": config.get("webManifestUrl") or "",
+        "fallbackType": "customtabs",
+        "features": {
+            "locationDelegation": {"enabled": bool(config.get("enableLocation"))},
+            "playBilling": {"enabled": False},
+        },
+        "alphaDependencies": {"enabled": False},
+        "enableSiteSettingsShortcut": True,
+        "isChromeOSOnly": False,
+        "isMetaQuest": False,
+        "fullScopeUrl": f"{parsed.scheme}://{host}/",
+        "minSdkVersion": int(config.get("minSdk") or TWA_MIN_SDK_DEFAULT),
+        "orientation": config.get("orientation") or "default",
+        "fingerprints": [],
+        "additionalTrustedOrigins": [],
+    }
+    (proj / "twa-manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+    logger.log(f"✅ twa-manifest.json généré ({host} → {package})")
+    return proj
+
+
+def run_bubblewrap_build(proj, logger):
+    """
+    `bubblewrap update` régénère le projet Android natif depuis le json
+    (télécharge l'icône, écrit AndroidManifest/gradle...), puis `build
+    --skipSigning` compile un APK non signé qu'on signe nous-mêmes.
+    """
+    bubblewrap = find_bubblewrap()
+    env = _twa_env(logger)
+    manifest_path = proj / "twa-manifest.json"
+
+    logger.log("🌐 Génération du projet Android depuis le manifest TWA (bubblewrap update)...")
+    cmd_update = [bubblewrap, "update", f"--manifest={manifest_path}"]
+    r1 = subprocess.run(cmd_update, cwd=str(proj), env=env, capture_output=True, text=True,
+                         encoding="utf-8", errors="replace", timeout=300)
+    for line in (r1.stdout or "").strip().split("\n"):
+        if line.strip(): logger.log(line)
+    for line in (r1.stderr or "").strip().split("\n"):
+        if line.strip(): logger.log("⚠ " + line)
+    if r1.returncode != 0:
+        raise RuntimeError("Échec de la génération du projet TWA (bubblewrap update) — voir logs ci-dessus.")
+
+    logger.log("🔨 Compilation du projet TWA (bubblewrap build --skipSigning)... (peut prendre plusieurs minutes)")
+    cmd_build = [bubblewrap, "build", f"--manifest={manifest_path}", "--skipSigning", "--skipPwaValidation"]
+    try:
+        r2 = subprocess.run(cmd_build, cwd=str(proj), env=env, capture_output=True, text=True,
+                             encoding="utf-8", errors="replace", timeout=1800)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("Timeout bubblewrap build (30 min dépassées) — build annulé.")
+    for line in (r2.stdout or "").strip().split("\n"):
+        if line.strip(): logger.log(line)
+    for line in (r2.stderr or "").strip().split("\n"):
+        if line.strip(): logger.log("⚠ " + line)
+    if r2.returncode != 0:
+        raise RuntimeError("Échec de la compilation TWA (bubblewrap build) — voir logs ci-dessus pour la cause exacte.")
+
+    # Noms observés selon versions de bubblewrap : app-release-unsigned.apk
+    # le plus courant avec --skipSigning. On retombe sur un glob si le nom
+    # a changé entre versions, en excluant tout ce qui serait déjà signé.
+    priority = ["app-release-unsigned.apk", "app-release-unsigned-aligned.apk"]
+    for name in priority:
+        p = proj / name
+        if p.exists():
+            logger.log(f"✅ APK TWA compilé : {p.name}")
+            return p
+    candidates = [p for p in proj.glob("*.apk") if "signed" not in p.name.lower()]
+    if not candidates:
+        candidates = list(proj.glob("*.apk"))
+    if not candidates:
+        raise RuntimeError(f"Build bubblewrap terminé mais aucun APK trouvé dans {proj}")
+    logger.log(f"✅ APK TWA compilé : {candidates[0].name}")
+    return candidates[0]
+
+
+def do_build_twa(config, icon_bytes):
+    """
+    Orchestration complète TWA : token OPS['twa'] dédié (indépendant de
+    'legacy'/'native'/'jadx', peut tourner en parallèle sans conflit).
+    icon_bytes n'est pas utilisé ici (bubblewrap exige une iconUrl
+    publique, pas un upload) — gardé au même endroit d'appel que
+    do_build_native pour une intégration symétrique côté /build-twa.
+    """
+    logger = OPS["twa"] = OpLogger()
+    logger.lines = []; logger.status = "building"; logger.result_file = None
+    sid = new_session_id()
+    logger.session = sid
+    try:
+        ensure_bubblewrap_config(logger)
+        proj = generate_twa_manifest(sid, config, logger)
+        unsigned_apk = run_bubblewrap_build(proj, logger)
+
+        app_name = (config.get("appName") or "MonApp").strip()
+        version_name = str(config.get("versionName") or "1.0")
+        out_name = f"{re.sub(r'[^A-Za-z0-9_.-]', '_', app_name)}_{version_name}_twa.apk"
+        min_sdk = config.get("minSdk") or TWA_MIN_SDK_DEFAULT
+        signing = config.get("signing", {"mode": "debug"})
+
+        final_apk = sign_native_apk(unsigned_apk, signing, proj, out_name, min_sdk, logger)
+        logger.result_file = str(final_apk)
+        logger.status = "done"
+    except Exception as e:
+        import traceback
+        logger.log(f"❌ Erreur: {e}")
+        logger.log(traceback.format_exc())
+        logger.status = "error"
+
+
+# =============================================================
+# PIPELINE CORDOVA — "site → app" via un vrai projet Cordova/Android
+# ---------------------------------------------------------------
+# 4e famille de méthode : contrairement à TWA (Custom Tabs + digital asset
+# links), ici on embarque le site dans une vraie WebView Cordova (offline
+# possible, accès aux plugins natifs). Le projet est créé/patché de façon
+# 100% non-interactive (pas de `cordova build`, qui peut lancer des
+# invites) puis compilé directement avec notre run_gradle_build existant :
+# cordova-android génère un projet Gradle standard sous platforms/android,
+# donc on réutilise tel quel le même run_gradle_build + sign_native_apk
+# que le pipeline natif, sans dupliquer la logique de compilation/signature.
+# =============================================================
+CORDOVA_MIN_SDK_DEFAULT = 24
+
+CORDOVA_ICON_DENSITIES = {
+    "ldpi": 36, "mdpi": 48, "hdpi": 72,
+    "xhdpi": 96, "xxhdpi": 144, "xxxhdpi": 192,
+}
+
+# Densités splash natives cordova-android (res/screen/android/screen-{density}.png),
+# tailles officielles port/paysage — cf. doc cordova-android "Splash Screen".
+CORDOVA_SPLASH_DENSITIES = {
+    "port-mdpi": (320, 480), "port-hdpi": (480, 800), "port-xhdpi": (720, 1280),
+    "port-xxhdpi": (960, 1600), "port-xxxhdpi": (1280, 1920),
+    "land-mdpi": (480, 320), "land-hdpi": (800, 480), "land-xhdpi": (1280, 720),
+    "land-xxhdpi": (1600, 960), "land-xxxhdpi": (1920, 1280),
+}
+
+
+def find_cordova():
+    """cordova installé en npm-global par setup.js dans tools/nodejs/."""
+    bundled = TOOLS_DIR / "nodejs" / ("cordova.cmd" if os.name == "nt" else "cordova")
+    if bundled.exists():
+        return str(bundled)
+    return shutil.which("cordova")
+
+
+def cordova_project_dir(sid):
+    return WORK_DIR / sid / "cordova_project"
+
+
+def _cordova_config_xml(package, app_name, version_name, min_sdk, orientation, icon_lines):
+    """Contenu de config.xml partagé par les 3 modes (url/scratch/template-écrasé)."""
+    return f'''<?xml version='1.0' encoding='utf-8'?>
+<widget id="{package}" version="{version_name}" xmlns="http://www.w3.org/ns/widgets" xmlns:android="http://schemas.android.com/apk/res/android">
+    <name>{app_name}</name>
+    <description>{app_name}</description>
+    <content src="index.html" />
+    <access origin="*" />
+    <allow-navigation href="*" />
+    <allow-intent href="http://*/*" />
+    <allow-intent href="https://*/*" />
+    <allow-intent href="tel:*" />
+    <allow-intent href="sms:*" />
+    <allow-intent href="mailto:*" />
+    <preference name="Orientation" value="{orientation}" />
+    <preference name="AndroidXEnabled" value="true" />
+    <preference name="AndroidPersistentFileLocation" value="Internal" />
+    <platform name="android">
+        <preference name="android-minSdkVersion" value="{min_sdk}" />
+        <preference name="AndroidLaunchMode" value="singleTask" />
+{icon_lines}
+    </platform>
+</widget>
+'''
+
+
+def _cordova_write_icons(proj, icon_bytes, logger):
+    icon_dir = proj / "res" / "icon" / "android"
+    icon_dir.mkdir(parents=True, exist_ok=True)
+    for density, size in CORDOVA_ICON_DENSITIES.items():
+        png = make_icon_png(icon_bytes, size)
+        (icon_dir / f"icon-{density}.png").write_bytes(png)
+    logger.log(f"✅ Icônes générées ({len(CORDOVA_ICON_DENSITIES)} densités)")
+
+
+def _cordova_write_splash(proj, splash_bytes, logger):
+    """Écrit les 10 densités port/land attendues par cordova-android sous
+    res/screen/android/screen-{density}.png — même mécanique que
+    _cordova_write_icons, jusque là seule l'icône était branchée."""
+    screen_dir = proj / "res" / "screen" / "android"
+    screen_dir.mkdir(parents=True, exist_ok=True)
+    for density, (w, h) in CORDOVA_SPLASH_DENSITIES.items():
+        png = make_splash_png(splash_bytes, w, h)
+        (screen_dir / f"screen-{density}.png").write_bytes(png)
+    logger.log(f"✅ Splash généré ({len(CORDOVA_SPLASH_DENSITIES)} densités)")
+
+
+def _cordova_scaffold(proj, package, app_name, logger):
+    """`cordova create` + `platform add android` — squelette vierge partagé
+    par les modes url et scratch (seul le contenu de www/ diffère ensuite)."""
+    cordova = find_cordova()
+    if not cordova:
+        raise RuntimeError(
+            "Cordova introuvable. Installe le composant 'cordova' depuis "
+            "l'écran des composants avant de générer une app Cordova."
+        )
+    env = _twa_env(logger)  # même besoin: JDK + ANDROID_HOME (cordova-android compile via Gradle)
+
+    logger.log("📦 Création du projet Cordova (cordova create)...")
+    cmd_create = [cordova, "create", str(proj), package, app_name, "--no-telemetry"]
+    r = subprocess.run(cmd_create, env=env, capture_output=True, text=True,
+                        encoding="utf-8", errors="replace", timeout=180)
+    for line in (r.stdout or "").strip().split("\n"):
+        if line.strip(): logger.log(line)
+    if r.returncode != 0:
+        logger.log("⚠ " + (r.stderr or "")[:500])
+        raise RuntimeError("Échec de `cordova create` — voir logs ci-dessus.")
+
+    logger.log("🤖 Ajout de la plateforme android (cordova platform add android)...")
+    cmd_platform = [cordova, "platform", "add", "android", "--no-telemetry"]
+    r = subprocess.run(cmd_platform, cwd=str(proj), env=env, capture_output=True, text=True,
+                        encoding="utf-8", errors="replace", timeout=300)
+    for line in (r.stdout or "").strip().split("\n"):
+        if line.strip(): logger.log(line)
+    if r.returncode != 0:
+        logger.log("⚠ " + (r.stderr or "")[:500])
+        raise RuntimeError("Échec de `cordova platform add android` — voir logs ci-dessus.")
+    return cordova, env
+
+
+def generate_cordova_project(sid, config, icon_bytes, splash_bytes, site_zip_bytes, logger):
+    """
+    Mode "url" (Site → App) ou "scratch" (site local zippé, embarqué
+    hors-ligne) — les deux partagent le même squelette Cordova, seule la
+    provenance du contenu de www/ change. Le mode "template" (import d'un
+    projet Cordova existant) est géré par generate_cordova_project_from_template.
+    """
+    source_mode = (config.get("sourceMode") or "url").strip()
+
+    package = normalize_package_name(config.get("packageName"), fallback="com.example.cordova")
+    app_name = (config.get("appName") or "MonApp").strip()
+    version_name = str(config.get("versionName") or "1.0")
+    min_sdk = int(config.get("minSdk") or CORDOVA_MIN_SDK_DEFAULT)
+    orientation = config.get("orientation") or "default"
+
+    url = ""
+    if source_mode == "scratch":
+        if not site_zip_bytes:
+            raise RuntimeError("Mode scratch : un zip du site (HTML/CSS/JS) est requis.")
+    else:
+        url = (config.get("url") or "").strip()
+        if not url or not url.startswith(("http://", "https://")):
+            raise RuntimeError("URL du site invalide ou manquante (doit commencer par http:// ou https://).")
+
+    proj = cordova_project_dir(sid)
+    if proj.exists():
+        shutil.rmtree(proj)
+    proj.parent.mkdir(parents=True, exist_ok=True)
+
+    _cordova_scaffold(proj, package, app_name, logger)
+
+    icon_lines = "\n".join(
+        f'        <icon density="{d}" src="res/icon/android/icon-{d}.png" />'
+        for d in CORDOVA_ICON_DENSITIES
+    )
+    splash_lines = "\n".join(
+        f'        <splash density="{d}" src="res/screen/android/screen-{d}.png" />'
+        for d in CORDOVA_SPLASH_DENSITIES
+    ) if splash_bytes else ""
+    platform_lines = "\n".join(x for x in (icon_lines, splash_lines) if x)
+    config_xml = _cordova_config_xml(package, app_name, version_name, min_sdk, orientation, platform_lines)
+    (proj / "config.xml").write_text(config_xml, encoding="utf-8")
+    logger.log(f"✅ config.xml généré ({package}, minSdk {min_sdk})")
+
+    www_dir = proj / "www"
+
+    if source_mode == "scratch":
+        # ── Site local zippé : on écrase le www/ par défaut avec le
+        # contenu fourni (même logique que le zip "site complet" du mode
+        # Scratch classique — extraction sécurisée + remontée d'un niveau
+        # si tout est dans un seul sous-dossier) ─────────────────────────
+        logger.log("🗂 Extraction du site local (zip)...")
+        shutil.rmtree(www_dir, ignore_errors=True)
+        www_dir.mkdir(parents=True, exist_ok=True)
+        zpath = proj / "site_upload.zip"
+        zpath.write_bytes(site_zip_bytes)
+        with zipfile.ZipFile(zpath) as zf:
+            _safe_extract_zip(zf, www_dir, logger)
+        children = list(www_dir.iterdir())
+        if len(children) == 1 and children[0].is_dir() and not (www_dir / "index.html").exists():
+            inner = children[0]
+            for item in inner.iterdir():
+                shutil.move(str(item), str(www_dir / item.name))
+            inner.rmdir()
+        zpath.unlink(missing_ok=True)
+        if (www_dir / "index.html").exists():
+            logger.log("✅ Site local extrait dans www/ (app 100% hors-ligne)")
+        else:
+            raise RuntimeError("Pas d'index.html trouvé à la racine du zip fourni (ni dans un unique sous-dossier).")
+    else:
+        # ── URL distante : redirige vers le site dès que le pont Cordova
+        # est prêt (deviceready) ────────────────────────────────────────
+        index_html = f'''<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta http-equiv="Content-Security-Policy" content="default-src * gap: data: blob: 'unsafe-inline' 'unsafe-eval';">
+    <title>{app_name}</title>
+    <style>html,body{{height:100%;margin:0;background:#fff}}</style>
+</head>
+<body>
+    <script src="cordova.js"></script>
+    <script>
+        document.addEventListener('deviceready', function () {{
+            window.location.href = {json.dumps(url)};
+        }}, false);
+        // Filet de sécurité si deviceready ne se déclenche pas (rare, mais
+        // observé sur certains émulateurs) : on force la navigation après
+        // un court délai plutôt que de laisser l'app bloquée sur un écran
+        // blanc indéfiniment.
+        setTimeout(function () {{
+            if (window.location.href.indexOf('index.html') !== -1) {{
+                window.location.href = {json.dumps(url)};
+            }}
+        }}, 3000);
+    </script>
+</body>
+</html>
+'''
+        (www_dir / "index.html").write_text(index_html, encoding="utf-8")
+        logger.log("✅ www/index.html généré (redirection vers le site au deviceready)")
+
+    _cordova_write_icons(proj, icon_bytes, logger)
+    if splash_bytes:
+        _cordova_write_splash(proj, splash_bytes, logger)
+    write_hybrid_session_meta(sid, "cordova", config)
+    return proj
+
+
+def _find_cordova_project_root(extract_dir):
+    """
+    Cherche config.xml à la racine du zip importé, ou un niveau plus bas
+    si tout est dans un unique sous-dossier (cas fréquent d'un zip
+    exporté depuis un explorateur de fichiers qui garde le dossier
+    parent) — même logique de remontée que pour un zip de site.
+    """
+    if (extract_dir / "config.xml").exists():
+        return extract_dir
+    children = [p for p in extract_dir.iterdir() if p.is_dir()]
+    if len(children) == 1 and (children[0] / "config.xml").exists():
+        return children[0]
+    return None
+
+
+def generate_cordova_project_from_template(sid, config, icon_bytes, splash_bytes, project_zip_bytes, logger):
+    """
+    Mode "template" : importe un projet Cordova EXISTANT (zippé) au lieu
+    d'en générer un vierge. Contrairement aux modes url/scratch, on ne
+    change PAS le package (widget id) par défaut — un projet Cordova
+    importé a potentiellement déjà des plugins/config liés à cet id, le
+    changer silencieusement pourrait casser des choses qu'on ne voit pas
+    depuis ce zip seul. On ne patch que ce que l'utilisateur a
+    explicitement renseigné (nom, version, icône) et on relance
+    `cordova prepare android` pour resynchroniser config.xml → le projet
+    Android natif AVANT de compiler nous-mêmes avec Gradle (indispensable
+    ici : contrairement aux modes url/scratch où config.xml existe avant
+    même `platform add`, un projet importé peut avoir platforms/android
+    déjà généré à partir d'un config.xml différent de celui qu'on patch).
+    """
+    if not project_zip_bytes:
+        raise RuntimeError("Mode template : un zip du projet Cordova existant est requis.")
+
+    proj = cordova_project_dir(sid)
+    if proj.exists():
+        shutil.rmtree(proj)
+    proj.parent.mkdir(parents=True, exist_ok=True)
+    proj.mkdir(parents=True, exist_ok=True)
+
+    logger.log("🗂 Extraction du projet Cordova importé (zip)...")
+    zpath = proj.parent / "cordova_template_upload.zip"
+    zpath.write_bytes(project_zip_bytes)
+    extract_tmp = proj.parent / "cordova_template_extract"
+    shutil.rmtree(extract_tmp, ignore_errors=True)
+    extract_tmp.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zpath) as zf:
+        _safe_extract_zip(zf, extract_tmp, logger)
+    zpath.unlink(missing_ok=True)
+
+    root = _find_cordova_project_root(extract_tmp)
+    if not root:
+        shutil.rmtree(extract_tmp, ignore_errors=True)
+        raise RuntimeError(
+            "config.xml introuvable dans le zip importé (ni à la racine, ni dans un unique "
+            "sous-dossier) — ce n'est pas un projet Cordova valide."
+        )
+    # Déplace le contenu du projet trouvé vers proj/ (peut être root lui-même ou un sous-dossier)
+    for item in root.iterdir():
+        shutil.move(str(item), str(proj / item.name))
+    shutil.rmtree(extract_tmp, ignore_errors=True)
+    logger.log(f"✅ Projet importé ({(proj / 'config.xml').stat().st_size} octets de config.xml)")
+
+    cordova = find_cordova()
+    if not cordova:
+        raise RuntimeError(
+            "Cordova introuvable. Installe le composant 'cordova' depuis "
+            "l'écran des composants avant de compiler un projet Cordova importé."
+        )
+    env = _twa_env(logger)
+
+    if not (proj / "platforms" / "android").exists():
+        logger.log("🤖 Le projet importé n'a pas de plateforme android — ajout (cordova platform add android)...")
+        r = subprocess.run([cordova, "platform", "add", "android", "--no-telemetry"],
+                            cwd=str(proj), env=env, capture_output=True, text=True,
+                            encoding="utf-8", errors="replace", timeout=300)
+        for line in (r.stdout or "").strip().split("\n"):
+            if line.strip(): logger.log(line)
+        if r.returncode != 0:
+            logger.log("⚠ " + (r.stderr or "")[:500])
+            raise RuntimeError("Échec de `cordova platform add android` sur le projet importé — voir logs ci-dessus.")
+
+    # ── Patch OPTIONNEL de config.xml : uniquement les champs que
+    # l'utilisateur a explicitement renseignés (le reste du projet importé
+    # — plugins, préférences custom, id — n'est jamais touché) ──────────
+    config_xml_path = proj / "config.xml"
+    xml_content = config_xml_path.read_text(encoding="utf-8")
+    app_name_override = (config.get("appName") or "").strip()
+    version_override = (config.get("versionName") or "").strip()
+    if app_name_override:
+        xml_content = re.sub(r'<name>[^<]*</name>', f'<name>{app_name_override}</name>', xml_content, count=1)
+        logger.log(f"✅ Nom de l'app surchargé : {app_name_override}")
+    if version_override:
+        xml_content = re.sub(r'(<widget[^>]*\bversion=")[^"]*(")', rf'\g<1>{version_override}\g<2>', xml_content, count=1)
+        logger.log(f"✅ Version surchargée : {version_override}")
+    config_xml_path.write_text(xml_content, encoding="utf-8")
+
+    if icon_bytes:
+        _cordova_write_icons(proj, icon_bytes, logger)
+    if splash_bytes:
+        _cordova_write_splash(proj, splash_bytes, logger)
+
+    # ── cordova prepare android : resynchronise config.xml (+ www/) vers
+    # platforms/android — étape indispensable ici puisqu'on ne passe PAS
+    # par `cordova build`, seulement par notre propre Gradle ensuite ────
+    logger.log("🔄 Resynchronisation config.xml → projet natif (cordova prepare android)...")
+    r = subprocess.run([cordova, "prepare", "android", "--no-telemetry"],
+                        cwd=str(proj), env=env, capture_output=True, text=True,
+                        encoding="utf-8", errors="replace", timeout=300)
+    for line in (r.stdout or "").strip().split("\n"):
+        if line.strip(): logger.log(line)
+    if r.returncode != 0:
+        logger.log("⚠ " + (r.stderr or "")[:500])
+        raise RuntimeError("Échec de `cordova prepare android` — voir logs ci-dessus.")
+
+    write_hybrid_session_meta(sid, "cordova", config)
+    return proj
+
+
+def do_generate_cordova_session(config, icon_bytes, splash_bytes=None, site_zip_bytes=None, project_zip_bytes=None):
+    """
+    Génère UNIQUEMENT le projet Cordova (pas de build Gradle) — permet à
+    l'utilisateur de l'ouvrir dans l'explorer/éditeur (comme scratch/
+    template) et de modifier les fichiers avant de compiler séparément
+    via /build-cordova avec {"session": sid}. Token OPS['cordova_gen'].
+    """
+    logger = OPS["cordova_gen"] = OpLogger()
+    logger.lines = []; logger.status = "building"; logger.result_file = None
+    sid = new_session_id()
+    logger.session = sid
+    try:
+        source_mode = (config.get("sourceMode") or "url").strip()
+        if source_mode == "template":
+            generate_cordova_project_from_template(sid, config, icon_bytes, splash_bytes, project_zip_bytes, logger)
+        else:
+            generate_cordova_project(sid, config, icon_bytes, splash_bytes, site_zip_bytes, logger)
+        logger.log(f"✅ Projet Cordova prêt — session {sid} (modifiable dans l'explorer)")
+        logger.status = "done"
+    except Exception as e:
+        import traceback
+        logger.log(f"❌ Erreur: {e}")
+        logger.log(traceback.format_exc())
+        logger.status = "error"
+
+
+def do_build_cordova(config, icon_bytes, splash_bytes=None, site_zip_bytes=None, project_zip_bytes=None):
+    """
+    Orchestration complète Cordova : token OPS['cordova'] dédié.
+    Dispatch sur config['sourceMode'] : 'url' (défaut) / 'scratch' /
+    'template'. cordova-android produit un projet Gradle standard sous
+    platforms/android — on réutilise run_gradle_build et sign_native_apk
+    tels quels (même logique que le pipeline natif), aucune duplication.
+    Si config['session'] pointe vers une session déjà générée (via
+    /cordova-generate, potentiellement modifiée par l'utilisateur dans
+    l'explorer), on saute complètement la (re)génération et on compile
+    directement le projet existant tel quel.
+    """
+    logger = OPS["cordova"] = OpLogger()
+    logger.lines = []; logger.status = "building"; logger.result_file = None
+    existing_sid = (config.get("session") or "").strip()
+    if existing_sid:
+        sid = existing_sid
+        logger.session = sid
+        try:
+            proj = cordova_project_dir(sid)
+            if not proj.exists():
+                raise RuntimeError(f"Session {sid} introuvable ou projet Cordova absent — régénère.")
+            logger.log(f"♻ Compilation depuis la session existante {sid} (fichiers tels que modifiés)")
+            android_dir = proj / "platforms" / "android"
+            build_type = "assembleDebug" if (config.get("signing", {}).get("mode") == "debug") else "assembleRelease"
+            unsigned_apk = run_gradle_build(android_dir, logger, build_type)
+            app_name = (config.get("appName") or "MonApp").strip()
+            version_name = str(config.get("versionName") or "1.0")
+            out_name = f"{re.sub(r'[^A-Za-z0-9_.-]', '_', app_name)}_{version_name}_cordova.apk"
+            min_sdk = config.get("minSdk") or CORDOVA_MIN_SDK_DEFAULT
+            signing = config.get("signing", {"mode": "debug"})
+            final_apk = sign_native_apk(unsigned_apk, signing, android_dir, out_name, min_sdk, logger)
+            logger.result_file = str(final_apk)
+            logger.status = "done"
+        except Exception as e:
+            import traceback
+            logger.log(f"❌ Erreur: {e}")
+            logger.log(traceback.format_exc())
+            logger.status = "error"
+        return
+    sid = new_session_id()
+    logger.session = sid
+    try:
+        source_mode = (config.get("sourceMode") or "url").strip()
+        if source_mode == "template":
+            proj = generate_cordova_project_from_template(sid, config, icon_bytes, splash_bytes, project_zip_bytes, logger)
+        else:
+            proj = generate_cordova_project(sid, config, icon_bytes, splash_bytes, site_zip_bytes, logger)
+        android_dir = proj / "platforms" / "android"
+        build_type = "assembleDebug" if (config.get("signing", {}).get("mode") == "debug") else "assembleRelease"
+        unsigned_apk = run_gradle_build(android_dir, logger, build_type)
+
+        app_name = (config.get("appName") or "MonApp").strip()
+        version_name = str(config.get("versionName") or "1.0")
+        out_name = f"{re.sub(r'[^A-Za-z0-9_.-]', '_', app_name)}_{version_name}_cordova.apk"
+        min_sdk = config.get("minSdk") or CORDOVA_MIN_SDK_DEFAULT
+        signing = config.get("signing", {"mode": "debug"})
+
+        final_apk = sign_native_apk(unsigned_apk, signing, android_dir, out_name, min_sdk, logger)
+        logger.result_file = str(final_apk)
+        logger.status = "done"
+    except Exception as e:
+        import traceback
+        logger.log(f"❌ Erreur: {e}")
+        logger.log(traceback.format_exc())
+        logger.status = "error"
+
+
+# =============================================================
+# PIPELINE FLUTTER — "site → app" via un vrai projet Flutter/Dart
+# ---------------------------------------------------------------
+# 5e famille de méthode : comme Cordova, une vraie WebView native (ici
+# via le package webview_flutter), mais avec la toolchain Flutter/Dart
+# (flutter create + flutter build apk) plutôt que Gradle appelé
+# directement — flutter build apk orchestre lui-même son propre Gradle
+# interne, donc pas de réutilisation possible de run_gradle_build ici.
+# On réutilise en revanche sign_native_apk : `flutter build apk --release`
+# produit par défaut un APK déjà signé avec la config debug (comportement
+# du template Flutter par défaut, cf. commentaire dans android/app/build.gradle),
+# mais apksigner peut re-signer un APK déjà signé sans problème — donc le
+# pipeline reste cohérent avec Cordova/TWA/natif (même clé de sortie, même
+# zipalign, même vérification finale) au lieu de garder la signature debug.
+# =============================================================
+FLUTTER_MIN_SDK_DEFAULT = 21
+
+FLUTTER_ICON_DENSITIES = {
+    "mipmap-mdpi": 48, "mipmap-hdpi": 72, "mipmap-xhdpi": 96,
+    "mipmap-xxhdpi": 144, "mipmap-xxxhdpi": 192,
+}
+
+# Densités du logo de splash (drawable-*), pas plein écran : le fond est
+# une couleur unie posée par launch_background.xml, le logo est centré
+# par-dessus via <bitmap android:gravity="center">.
+FLUTTER_SPLASH_DENSITIES = {
+    "drawable-mdpi": 192, "drawable-hdpi": 288, "drawable-xhdpi": 384,
+    "drawable-xxhdpi": 576, "drawable-xxxhdpi": 768,
+}
+
+WEBVIEW_FLUTTER_VERSION = "^4.7.0"
+
+
+def _flutter_write_splash(proj, splash_bytes, logger, bg_color="#FFFFFF"):
+    """Branche le splash natif Android d'un projet Flutter généré par
+    `flutter create` : celui-ci scaffold déjà res/drawable/launch_background.xml
+    (fond uni, bitmap centré en commentaire) — on écrit le logo par densité
+    et on réécrit launch_background.xml pour l'activer réellement, au lieu
+    de laisser le splash par défaut (fond blanc uni, sans logo)."""
+    res_dir = proj / "android" / "app" / "src" / "main" / "res"
+    for density_dir, size in FLUTTER_SPLASH_DENSITIES.items():
+        target_dir = res_dir / density_dir
+        target_dir.mkdir(parents=True, exist_ok=True)
+        png = make_splash_png(splash_bytes, size, size, bg_color=(255, 255, 255, 0))
+        (target_dir / "splash_logo.png").write_bytes(png)
+
+    launch_bg_xml = f'''<?xml version="1.0" encoding="utf-8"?>
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:drawable="@color/splashBackground" />
+    <item>
+        <bitmap
+            android:gravity="center"
+            android:src="@drawable/splash_logo" />
+    </item>
+</layer-list>
+'''
+    drawable_dir = res_dir / "drawable"
+    drawable_dir.mkdir(parents=True, exist_ok=True)
+    (drawable_dir / "launch_background.xml").write_text(launch_bg_xml, encoding="utf-8")
+    drawable_v21_dir = res_dir / "drawable-v21"
+    if drawable_v21_dir.exists():
+        (drawable_v21_dir / "launch_background.xml").write_text(launch_bg_xml, encoding="utf-8")
+
+    values_dir = res_dir / "values"
+    values_dir.mkdir(parents=True, exist_ok=True)
+    colors_path = values_dir / "colors.xml"
+    if colors_path.exists():
+        colors_xml = colors_path.read_text(encoding="utf-8")
+        if "splashBackground" not in colors_xml:
+            colors_xml = colors_xml.replace(
+                "</resources>", f'    <color name="splashBackground">{bg_color}</color>\n</resources>', 1
+            )
+    else:
+        colors_xml = (
+            '<?xml version="1.0" encoding="utf-8"?>\n<resources>\n'
+            f'    <color name="splashBackground">{bg_color}</color>\n</resources>\n'
+        )
+    colors_path.write_text(colors_xml, encoding="utf-8")
+
+    # Le template par défaut de `flutter create` fait déjà pointer le thème
+    # de lancement vers @drawable/launch_background — mais un projet importé
+    # (mode template) peut avoir un styles.xml personnalisé qui ne le fait
+    # pas, auquel cas les fichiers écrits ci-dessus restent inertes (même
+    # limite que le garde-fou React Native ci-dessous).
+    styles_path = values_dir / "styles.xml"
+    if styles_path.exists() and "launch_background" not in styles_path.read_text(encoding="utf-8"):
+        logger.log("⚠ styles.xml ne référence pas @drawable/launch_background — splash écrit mais probablement "
+                    "pas actif (projet importé avec un thème de lancement personnalisé). Vérifie le thème appliqué "
+                    "à l'activité de lancement dans AndroidManifest.xml.")
+
+    logger.log(f"✅ Splash généré ({len(FLUTTER_SPLASH_DENSITIES)} densités) — launch_background.xml activé")
+
+
+def find_flutter():
+    """flutter téléchargé par setup.js dans tools/flutter/bin/."""
+    bundled = TOOLS_DIR / "flutter" / "bin" / ("flutter.bat" if os.name == "nt" else "flutter")
+    if bundled.exists():
+        return str(bundled)
+    return shutil.which("flutter")
+
+
+def flutter_project_dir(sid):
+    return WORK_DIR / sid / "flutter_project"
+
+
+def _flutter_env(logger):
+    """JDK + ANDROID_HOME comme les autres pipelines, + CI=true pour éviter
+    le message d'accueil interactif de Flutter (consentement analytics) au
+    tout premier lancement, qui sinon peut bloquer un subprocess non-TTY."""
+    env = _twa_env(logger)
+    env["CI"] = "true"
+    return env
+
+
+def _flutter_org_and_name(package):
+    """
+    Découpe un identifiant Android complet (com.example.monapp) en
+    org (com.example) + nom de projet Flutter valide (snake_case,
+    commence par une lettre — contrainte de `flutter create`).
+    """
+    parts = [p for p in package.split(".") if p]
+    if len(parts) >= 2:
+        org = ".".join(parts[:-1])
+        raw_name = parts[-1]
+    else:
+        org = "com.example"
+        raw_name = parts[0] if parts else "app"
+    name = re.sub(r'[^a-z0-9_]', '_', raw_name.lower())
+    name = re.sub(r'_+', '_', name).strip('_') or "flutter_app"
+    if not re.match(r'^[a-z]', name):
+        name = "app_" + name
+    return org, name
+
+
+def _flutter_collect_asset_dirs(www_dir):
+    """
+    pubspec.yaml ne bundle QUE les fichiers directement listés ou les
+    fichiers directs d'un dossier listé (pas de récursion automatique
+    comme pour un zip Cordova/www classique) — on énumère donc chaque
+    sous-dossier contenant au moins un fichier pour les déclarer un par
+    un sous `flutter: assets:`. Chemins retournés relatifs à la racine
+    du projet Flutter (ex: "assets/www/", "assets/www/css/"), pas juste
+    à assets/ — c'est ce que pubspec.yaml attend.
+    """
+    proj_root = www_dir.parent.parent  # www_dir = proj/assets/www → proj
+    dirs = []
+    for root, _, files in os.walk(www_dir):
+        if files:
+            rel = Path(root).relative_to(proj_root)
+            dirs.append(str(rel).replace(os.sep, "/") + "/")
+    return sorted(dirs)
+
+
+def generate_flutter_project(sid, config, icon_bytes, splash_bytes, site_zip_bytes, logger):
+    """
+    `flutter create` (non-interactif) puis patch minimal : dépendance
+    webview_flutter dans pubspec.yaml, lib/main.dart remplacé par une
+    simple WebView plein écran chargeant l'URL (mode "url") ou un site
+    local embarqué en asset Flutter (mode "scratch", 100% hors-ligne),
+    permission INTERNET, label et icônes — même esprit que
+    generate_cordova_project. Le mode "template" (import d'un projet
+    Flutter existant) est géré par generate_flutter_project_from_template.
+    """
+    flutter = find_flutter()
+    if not flutter:
+        raise RuntimeError(
+            "Flutter introuvable. Installe le composant 'flutter' depuis "
+            "l'écran des composants avant de générer une app Flutter."
+        )
+
+    source_mode = (config.get("sourceMode") or "url").strip()
+
+    url = ""
+    if source_mode == "scratch":
+        if not site_zip_bytes:
+            raise RuntimeError("Mode scratch : un zip du site (HTML/CSS/JS) est requis.")
+    else:
+        url = (config.get("url") or "").strip()
+        if not url or not url.startswith(("http://", "https://")):
+            raise RuntimeError("URL du site invalide ou manquante (doit commencer par http:// ou https://).")
+
+    package = normalize_package_name(config.get("packageName"), fallback="com.example.flutterapp")
+    app_name = (config.get("appName") or "MonApp").strip()
+    version_name = str(config.get("versionName") or "1.0")
+    version_code = str(config.get("versionCode") or "1")
+    org, proj_name = _flutter_org_and_name(package)
+
+    proj = flutter_project_dir(sid)
+    if proj.exists():
+        shutil.rmtree(proj)
+    proj.parent.mkdir(parents=True, exist_ok=True)
+
+    env = _flutter_env(logger)
+
+    logger.log("📦 Création du projet Flutter (flutter create)...")
+    cmd_create = [flutter, "create", "--platforms=android", "--org", org,
+                  "--project-name", proj_name, "--no-pub", str(proj)]
+    r = subprocess.run(cmd_create, env=env, capture_output=True, text=True,
+                        encoding="utf-8", errors="replace", timeout=300)
+    for line in (r.stdout or "").strip().split("\n"):
+        if line.strip(): logger.log(line)
+    if r.returncode != 0:
+        logger.log("⚠ " + (r.stderr or "")[:500])
+        raise RuntimeError("Échec de `flutter create` — voir logs ci-dessus.")
+
+    # ── pubspec.yaml : ajoute webview_flutter + fixe version/build number ──
+    pubspec_path = proj / "pubspec.yaml"
+    pubspec = pubspec_path.read_text(encoding="utf-8")
+    if "webview_flutter" not in pubspec:
+        pubspec = pubspec.replace("dependencies:\n", f"dependencies:\n  webview_flutter: {WEBVIEW_FLUTTER_VERSION}\n", 1)
+    pubspec = re.sub(r'^version:\s*.*$', f"version: {version_name}+{version_code}", pubspec, count=1, flags=re.MULTILINE)
+
+    www_dir = proj / "assets" / "www"
+    if source_mode == "scratch":
+        # ── Site local zippé : extrait dans assets/www/, puis déclaré
+        # dans pubspec.yaml (flutter: assets:) pour être bundlé dans
+        # l'APK — l'app n'a besoin d'aucune connexion réseau pour
+        # s'ouvrir (mêmes conventions d'extraction que le mode scratch
+        # Cordova : remontée d'un niveau si tout est dans un sous-dossier) ─
+        logger.log("🗂 Extraction du site local (zip)...")
+        www_dir.mkdir(parents=True, exist_ok=True)
+        zpath = proj / "site_upload.zip"
+        zpath.write_bytes(site_zip_bytes)
+        with zipfile.ZipFile(zpath) as zf:
+            _safe_extract_zip(zf, www_dir, logger)
+        children = list(www_dir.iterdir())
+        if len(children) == 1 and children[0].is_dir() and not (www_dir / "index.html").exists():
+            inner = children[0]
+            for item in inner.iterdir():
+                shutil.move(str(item), str(www_dir / item.name))
+            inner.rmdir()
+        zpath.unlink(missing_ok=True)
+        if not (www_dir / "index.html").exists():
+            raise RuntimeError("Pas d'index.html trouvé à la racine du zip fourni (ni dans un unique sous-dossier).")
+
+        asset_dirs = _flutter_collect_asset_dirs(www_dir)
+        assets_yaml = "".join(f"    - {d}\n" for d in asset_dirs)
+        if "uses-material-design: true" in pubspec:
+            pubspec = pubspec.replace(
+                "uses-material-design: true",
+                "uses-material-design: true\n\n  assets:\n" + assets_yaml,
+                1
+            )
+        else:
+            pubspec += "\nflutter:\n  assets:\n" + assets_yaml
+        logger.log(f"✅ Site local extrait dans assets/www/ ({len(asset_dirs)} dossier(s) déclaré(s), app 100% hors-ligne)")
+
+    pubspec_path.write_text(pubspec, encoding="utf-8")
+    logger.log("✅ pubspec.yaml patché (webview_flutter + version" + (" + assets" if source_mode == "scratch" else "") + ")")
+
+    logger.log("📥 Récupération des dépendances (flutter pub get)...")
+    r = subprocess.run([flutter, "pub", "get"], cwd=str(proj), env=env, capture_output=True,
+                        text=True, encoding="utf-8", errors="replace", timeout=300)
+    for line in (r.stdout or "").strip().split("\n"):
+        if line.strip(): logger.log(line)
+    if r.returncode != 0:
+        logger.log("⚠ " + (r.stderr or "")[:500])
+        raise RuntimeError("Échec de `flutter pub get` — voir logs ci-dessus (dépendance webview_flutter introuvable ?).")
+
+    # ── lib/main.dart : remplace le compteur par défaut par une WebView
+    # plein écran qui charge directement l'URL du site (mode url) ou
+    # l'asset local embarqué (mode scratch, loadFlutterAsset au lieu de
+    # loadRequest — aucune requête réseau nécessaire) ────────────────────
+    if source_mode == "scratch":
+        load_call = "..loadFlutterAsset('assets/www/index.html')"
+    else:
+        load_call = f"..loadRequest(Uri.parse({json.dumps(url)}))"
+    main_dart = f'''import 'package:flutter/material.dart';
+import 'package:webview_flutter/webview_flutter.dart';
+
+void main() {{
+  runApp(const MyApp());
+}}
+
+class MyApp extends StatelessWidget {{
+  const MyApp({{super.key}});
+
+  @override
+  Widget build(BuildContext context) {{
+    return MaterialApp(
+      title: {json.dumps(app_name)},
+      debugShowCheckedModeBanner: false,
+      home: const WebViewScreen(),
+    );
+  }}
+}}
+
+class WebViewScreen extends StatefulWidget {{
+  const WebViewScreen({{super.key}});
+
+  @override
+  State<WebViewScreen> createState() => _WebViewScreenState();
+}}
+
+class _WebViewScreenState extends State<WebViewScreen> {{
+  late final WebViewController _controller;
+
+  @override
+  void initState() {{
+    super.initState();
+    _controller = WebViewController()
+      ..setJavaScriptMode(JavaScriptMode.unrestricted)
+      ..setBackgroundColor(const Color(0xFFFFFFFF))
+      {load_call};
+  }}
+
+  @override
+  Widget build(BuildContext context) {{
+    return Scaffold(
+      body: SafeArea(
+        child: WebViewWidget(controller: _controller),
+      ),
+    );
+  }}
+}}
+'''
+    (proj / "lib" / "main.dart").write_text(main_dart, encoding="utf-8")
+    logger.log("✅ lib/main.dart généré (WebView plein écran vers " + ("l'asset local" if source_mode == "scratch" else "le site") + ")")
+
+    # ── AndroidManifest.xml : label affiché + permission INTERNET (le
+    # template Flutter par défaut ne la déclare pas — sans elle la
+    # WebView échoue silencieusement au chargement) ─────────────────────
+    manifest_path = proj / "android" / "app" / "src" / "main" / "AndroidManifest.xml"
+    manifest = manifest_path.read_text(encoding="utf-8")
+    manifest = re.sub(r'android:label="[^"]*"', f'android:label="{app_name}"', manifest, count=1)
+    if "android.permission.INTERNET" not in manifest:
+        manifest = manifest.replace(
+            "<application",
+            '<uses-permission android:name="android.permission.INTERNET" />\n    <application',
+            1
+        )
+    manifest_path.write_text(manifest, encoding="utf-8")
+    logger.log("✅ AndroidManifest.xml patché (label + permission INTERNET)")
+
+    # ── Icônes : écrase les mipmaps par défaut du template avec l'icône
+    # fournie (ou une icône unie par défaut) — mêmes densités que Cordova ──
+    res_dir = proj / "android" / "app" / "src" / "main" / "res"
+    written = 0
+    for density_dir, size in FLUTTER_ICON_DENSITIES.items():
+        target_dir = res_dir / density_dir
+        if not target_dir.exists():
+            target_dir.mkdir(parents=True, exist_ok=True)
+        png = make_icon_png(icon_bytes, size)
+        (target_dir / "ic_launcher.png").write_bytes(png)
+        written += 1
+    logger.log(f"✅ Icônes générées ({written} densités)")
+
+    if splash_bytes:
+        _flutter_write_splash(proj, splash_bytes, logger)
+
+    write_hybrid_session_meta(sid, "flutter", config)
+    return proj
+
+
+def _find_flutter_project_root(extract_dir):
+    """
+    Cherche pubspec.yaml à la racine du zip importé, ou un niveau plus
+    bas si tout est dans un unique sous-dossier — même logique de
+    remontée que _find_cordova_project_root.
+    """
+    if (extract_dir / "pubspec.yaml").exists():
+        return extract_dir
+    children = [p for p in extract_dir.iterdir() if p.is_dir()]
+    if len(children) == 1 and (children[0] / "pubspec.yaml").exists():
+        return children[0]
+    return None
+
+
+def generate_flutter_project_from_template(sid, config, icon_bytes, splash_bytes, project_zip_bytes, logger):
+    """
+    Mode "template" : importe un projet Flutter EXISTANT (zippé) au lieu
+    d'en générer un vierge. On ne touche PAS au package (applicationId
+    Android / bundle Dart déjà en place dans le projet importé) — on ne
+    patch que ce que l'utilisateur a explicitement renseigné (nom
+    affiché, version, icône), même prudence que le mode template Cordova.
+    """
+    if not project_zip_bytes:
+        raise RuntimeError("Mode template : un zip du projet Flutter existant est requis.")
+
+    proj = flutter_project_dir(sid)
+    if proj.exists():
+        shutil.rmtree(proj)
+    proj.parent.mkdir(parents=True, exist_ok=True)
+    proj.mkdir(parents=True, exist_ok=True)
+
+    logger.log("🗂 Extraction du projet Flutter importé (zip)...")
+    zpath = proj.parent / "flutter_template_upload.zip"
+    zpath.write_bytes(project_zip_bytes)
+    extract_tmp = proj.parent / "flutter_template_extract"
+    shutil.rmtree(extract_tmp, ignore_errors=True)
+    extract_tmp.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zpath) as zf:
+        _safe_extract_zip(zf, extract_tmp, logger)
+    zpath.unlink(missing_ok=True)
+
+    root = _find_flutter_project_root(extract_tmp)
+    if not root:
+        shutil.rmtree(extract_tmp, ignore_errors=True)
+        raise RuntimeError(
+            "pubspec.yaml introuvable dans le zip importé (ni à la racine, ni dans un unique "
+            "sous-dossier) — ce n'est pas un projet Flutter valide."
+        )
+    for item in root.iterdir():
+        shutil.move(str(item), str(proj / item.name))
+    shutil.rmtree(extract_tmp, ignore_errors=True)
+    logger.log(f"✅ Projet importé ({(proj / 'pubspec.yaml').stat().st_size} octets de pubspec.yaml)")
+
+    if not (proj / "android").exists():
+        raise RuntimeError(
+            "Le projet Flutter importé n'a pas de dossier android/ — impossible de compiler un "
+            "APK à partir de ce zip (projet créé sans la plateforme Android ?)."
+        )
+
+    # ── Patch OPTIONNEL : uniquement les champs explicitement renseignés
+    # (le reste — dépendances, plugins, id — n'est jamais touché) ────────
+    app_name_override = (config.get("appName") or "").strip()
+    version_override = (config.get("versionName") or "").strip()
+    if app_name_override or version_override:
+        pubspec_path = proj / "pubspec.yaml"
+        pubspec = pubspec_path.read_text(encoding="utf-8")
+        if version_override:
+            version_code = str(config.get("versionCode") or "1")
+            pubspec = re.sub(r'^version:\s*.*$', f"version: {version_override}+{version_code}",
+                              pubspec, count=1, flags=re.MULTILINE)
+            logger.log(f"✅ Version surchargée : {version_override}")
+        pubspec_path.write_text(pubspec, encoding="utf-8")
+        if app_name_override:
+            manifest_path = proj / "android" / "app" / "src" / "main" / "AndroidManifest.xml"
+            if manifest_path.exists():
+                manifest = manifest_path.read_text(encoding="utf-8")
+                manifest = re.sub(r'android:label="[^"]*"', f'android:label="{app_name_override}"',
+                                   manifest, count=1)
+                manifest_path.write_text(manifest, encoding="utf-8")
+                logger.log(f"✅ Nom de l'app surchargé : {app_name_override}")
+
+    if icon_bytes:
+        res_dir = proj / "android" / "app" / "src" / "main" / "res"
+        written = 0
+        for density_dir, size in FLUTTER_ICON_DENSITIES.items():
+            target_dir = res_dir / density_dir
+            target_dir.mkdir(parents=True, exist_ok=True)
+            png = make_icon_png(icon_bytes, size)
+            (target_dir / "ic_launcher.png").write_bytes(png)
+            written += 1
+        logger.log(f"✅ Icônes surchargées ({written} densités)")
+
+    if splash_bytes:
+        _flutter_write_splash(proj, splash_bytes, logger)
+
+    logger.log("📥 Récupération des dépendances (flutter pub get)...")
+    flutter = find_flutter()
+    if flutter:
+        env = _flutter_env(logger)
+        r = subprocess.run([flutter, "pub", "get"], cwd=str(proj), env=env, capture_output=True,
+                            text=True, encoding="utf-8", errors="replace", timeout=300)
+        for line in (r.stdout or "").strip().split("\n"):
+            if line.strip(): logger.log(line)
+        if r.returncode != 0:
+            logger.log("⚠ " + (r.stderr or "")[:500])
+            raise RuntimeError("Échec de `flutter pub get` sur le projet importé — voir logs ci-dessus.")
+
+    write_hybrid_session_meta(sid, "flutter", config)
+    return proj
+
+
+def run_flutter_build(proj, logger, build_type="release"):
+    """
+    `flutter build apk` orchestre son propre Gradle interne (contrairement
+    à Cordova) — impossible/inutile de passer par run_gradle_build ici.
+    """
+    flutter = find_flutter()
+    env = _flutter_env(logger)
+    variant = "release" if build_type == "release" else "debug"
+
+    logger.log(f"🔨 Compilation Flutter ({variant})... (peut prendre plusieurs minutes la 1ère fois)")
+    cmd = [flutter, "build", "apk", f"--{variant}"]
+    logger.log(f"$ {' '.join(cmd)}")
+    try:
+        r = subprocess.run(cmd, cwd=str(proj), env=env, capture_output=True,
+                            text=True, encoding="utf-8", errors="replace", timeout=1800)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("Timeout flutter build (30 min dépassées) — build annulé.")
+    for line in (r.stdout or "").strip().split("\n"):
+        if line.strip(): logger.log(line)
+    for line in (r.stderr or "").strip().split("\n"):
+        if line.strip(): logger.log("⚠ " + line)
+    if r.returncode != 0:
+        raise RuntimeError("Échec de la compilation Flutter — voir les logs ci-dessus pour la cause exacte.")
+
+    apk_path = proj / "build" / "app" / "outputs" / "flutter-apk" / f"app-{variant}.apk"
+    if not apk_path.exists():
+        candidates = list((proj / "build" / "app" / "outputs" / "flutter-apk").glob("*.apk")) \
+            if (proj / "build" / "app" / "outputs" / "flutter-apk").exists() else []
+        if not candidates:
+            raise RuntimeError(f"Build Flutter terminé mais aucun APK trouvé pour la variante {variant}.")
+        apk_path = candidates[0]
+    logger.log(f"✅ APK Flutter compilé : {apk_path.name}")
+    return apk_path
+
+
+# =============================================================
+# PIPELINE REACT NATIVE — "site → app" via un vrai projet RN/Android
+# ---------------------------------------------------------------
+# 6e famille de méthode : embarque le site dans une WebView via le
+# module communautaire react-native-webview. C'EST LA MÉTHODE LA PLUS
+# FRAGILE DES TROIS (Cordova/Flutter/RN), pour des raisons réelles et
+# pas juste par précaution :
+#   - `react-native init` télécharge un template complet depuis npm ET
+#     lance `npm install` (des centaines de paquets) → sensible à un
+#     réseau instable ou lent, contrairement à Cordova/Flutter qui
+#     téléchargent beaucoup moins à la création du projet.
+#   - react-native-webview est installé après coup via npm (dépendance
+#     supplémentaire, donc point de défaillance réseau de plus).
+#   - Autolinking Android : fonctionne nativement depuis RN 0.71+ sans
+#     configuration manuelle, mais reste plus opaque à déboguer que les
+#     deux autres pipelines si une version de react-native-webview n'est
+#     pas compatible avec la version de React Native du template.
+#   - Comme pour Cordova, on invoque directement notre propre binaire
+#     Gradle sur android/ (run_gradle_build) plutôt que le gradlew généré
+#     par le template — qui, laissé à lui-même, tenterait de télécharger
+#     SA PROPRE version de Gradle depuis services.gradle.org.
+#   - On compile toujours en mode "assembleRelease" (jamais "assembleDebug")
+#     même si l'utilisateur choisit une signature debug : côté React
+#     Native, seule la variante release embarque le bundle JS dans l'APK
+#     via le hook Gradle bundleReleaseJsAndAssets. Une "assembleDebug"
+#     produirait un APK qui attend un serveur Metro externe et ne
+#     fonctionnerait pas de façon autonome sur un téléphone.
+# =============================================================
+RN_ICON_DENSITIES = {
+    "mipmap-mdpi": 48, "mipmap-hdpi": 72, "mipmap-xhdpi": 96,
+    "mipmap-xxhdpi": 144, "mipmap-xxxhdpi": 192,
+}
+REACT_NATIVE_WEBVIEW_VERSION = "^13.8.6"
+
+# Densités du logo de splash (drawable-*) — même convention que Flutter :
+# fond uni + logo centré, jamais étiré.
+RN_SPLASH_DENSITIES = {
+    "drawable-mdpi": 192, "drawable-hdpi": 288, "drawable-xhdpi": 384,
+    "drawable-xxhdpi": 576, "drawable-xxxhdpi": 768,
+}
+
+
+def _rn_write_splash(proj, splash_bytes, logger, bg_color="#FFFFFF"):
+    """Branche un splash natif sur un projet React Native, qui n'en a
+    aucun par défaut (contrairement à Flutter, `react-native init` ne
+    scaffold rien pour ça) : android:windowBackground de AppTheme reste
+    posé le temps que le thread JS mesure et affiche la racine RN — donc
+    le fond+logo posé ici agit comme splash screen sans dépendance
+    externe (react-native-splash-screen), même principe que de nombreux
+    tutoriels 'splash sans lib'."""
+    res_dir = proj / "android" / "app" / "src" / "main" / "res"
+    for density_dir, size in RN_SPLASH_DENSITIES.items():
+        target_dir = res_dir / density_dir
+        target_dir.mkdir(parents=True, exist_ok=True)
+        png = make_splash_png(splash_bytes, size, size, bg_color=(255, 255, 255, 0))
+        (target_dir / "splash_logo.png").write_bytes(png)
+
+    drawable_dir = res_dir / "drawable"
+    drawable_dir.mkdir(parents=True, exist_ok=True)
+    (drawable_dir / "splash_background.xml").write_text(
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<layer-list xmlns:android="http://schemas.android.com/apk/res/android">\n'
+        '    <item android:drawable="@color/splashBackground" />\n'
+        '    <item>\n'
+        '        <bitmap\n'
+        '            android:gravity="center"\n'
+        '            android:src="@drawable/splash_logo" />\n'
+        '    </item>\n'
+        '</layer-list>\n',
+        encoding="utf-8"
+    )
+
+    values_dir = res_dir / "values"
+    values_dir.mkdir(parents=True, exist_ok=True)
+    colors_path = values_dir / "colors.xml"
+    if colors_path.exists():
+        colors_xml = colors_path.read_text(encoding="utf-8")
+        if "splashBackground" not in colors_xml:
+            colors_xml = colors_xml.replace(
+                "</resources>", f'    <color name="splashBackground">{bg_color}</color>\n</resources>', 1
+            )
+    else:
+        colors_xml = (
+            '<?xml version="1.0" encoding="utf-8"?>\n<resources>\n'
+            f'    <color name="splashBackground">{bg_color}</color>\n</resources>\n'
+        )
+    colors_path.write_text(colors_xml, encoding="utf-8")
+
+    styles_path = values_dir / "styles.xml"
+    if styles_path.exists():
+        styles_xml = styles_path.read_text(encoding="utf-8")
+        if "android:windowBackground" in styles_xml:
+            styles_xml = re.sub(
+                r'<item name="android:windowBackground">[^<]*</item>',
+                '<item name="android:windowBackground">@drawable/splash_background</item>',
+                styles_xml, count=1
+            )
+        else:
+            styles_xml = re.sub(
+                r'(<style name="AppTheme"[^>]*>)',
+                r'\1\n        <item name="android:windowBackground">@drawable/splash_background</item>',
+                styles_xml, count=1
+            )
+        styles_path.write_text(styles_xml, encoding="utf-8")
+        logger.log(f"✅ Splash généré ({len(RN_SPLASH_DENSITIES)} densités) — styles.xml patché (windowBackground)")
+    else:
+        logger.log("⚠ styles.xml introuvable — splash_background.xml écrit mais pas activé "
+                    "(ajoute manuellement android:windowBackground=@drawable/splash_background à AppTheme).")
+
+
+def find_react_native_cli():
+    """react-native (CLI globale @react-native-community/cli) installée
+    en npm-global par setup.js dans tools/nodejs/."""
+    bundled = TOOLS_DIR / "nodejs" / ("react-native.cmd" if os.name == "nt" else "react-native")
+    if bundled.exists():
+        return str(bundled)
+    return shutil.which("react-native")
+
+
+def find_npm():
+    bundled = TOOLS_DIR / "nodejs" / ("npm.cmd" if os.name == "nt" else "npm")
+    if bundled.exists():
+        return str(bundled)
+    return shutil.which("npm")
+
+
+def react_native_project_dir(sid):
+    return WORK_DIR / sid / "rn_project"
+
+
+def _rn_env(logger):
+    """JDK + ANDROID_HOME comme les autres pipelines hybrides, + Node.js
+    en tête de PATH (nécessaire aux sous-process npm/npx internes à la
+    CLI React Native, même quand on invoque react-native.cmd directement)."""
+    env = _twa_env(logger)
+    nodejs_dir = TOOLS_DIR / "nodejs"
+    if nodejs_dir.exists():
+        env["PATH"] = str(nodejs_dir) + os.pathsep + env.get("PATH", "")
+    env["CI"] = "true"
+    return env
+
+
+def _rn_project_name(app_name):
+    """
+    `react-native init` exige un nom de projet alphanumérique commençant
+    par une lettre (utilisé aussi bien comme nom de dossier que comme
+    identifiant Java/Gradle) — donc plus strict que le nom d'app affiché.
+    """
+    name = re.sub(r'[^A-Za-z0-9]', '', app_name or "")
+    if not name or not name[0].isalpha():
+        name = "App" + name
+    return name[:50] or "MonAppRN"
+
+
+def generate_react_native_project(sid, config, icon_bytes, splash_bytes, site_zip_bytes, logger):
+    """
+    `react-native init` (avec --package-name pour éviter tout patch
+    manuel fragile du package Java/AndroidManifest après coup), puis
+    ajout de react-native-webview et remplacement de App.tsx/App.js par
+    une WebView plein écran chargeant l'URL (mode "url") ou un site local
+    embarqué dans les assets Android (mode "scratch", 100% hors-ligne) —
+    même esprit que generate_cordova_project / generate_flutter_project,
+    mais avec des étapes réseau supplémentaires (voir avertissement en
+    tête de section). Le mode "template" (import d'un projet RN existant)
+    est géré par generate_react_native_project_from_template.
+    """
+    rn_cli = find_react_native_cli()
+    if not rn_cli:
+        raise RuntimeError(
+            "React Native CLI introuvable. Installe le composant 'reactNativeCli' "
+            "depuis l'écran des composants avant de générer une app React Native."
+        )
+    npm = find_npm()
+    if not npm:
+        raise RuntimeError("npm introuvable — installe le composant 'nodejs' avant de générer une app React Native.")
+
+    source_mode = (config.get("sourceMode") or "url").strip()
+
+    url = ""
+    if source_mode == "scratch":
+        if not site_zip_bytes:
+            raise RuntimeError("Mode scratch : un zip du site (HTML/CSS/JS) est requis.")
+    else:
+        url = (config.get("url") or "").strip()
+        if not url or not url.startswith(("http://", "https://")):
+            raise RuntimeError("URL du site invalide ou manquante (doit commencer par http:// ou https://).")
+
+    package = normalize_package_name(config.get("packageName"), fallback="com.example.rnapp")
+    app_name = (config.get("appName") or "MonApp").strip()
+    version_name = str(config.get("versionName") or "1.0")
+    version_code = str(config.get("versionCode") or "1")
+    proj_name = _rn_project_name(app_name)
+
+    proj = react_native_project_dir(sid)
+    if proj.exists():
+        shutil.rmtree(proj)
+    proj.parent.mkdir(parents=True, exist_ok=True)
+
+    env = _rn_env(logger)
+
+    logger.log("📦 Création du projet React Native (react-native init)... (télécharge le template + npm install, peut prendre plusieurs minutes)")
+    cmd_init = [rn_cli, "init", proj_name, "--directory", str(proj),
+                "--package-name", package, "--skip-install", "false"]
+    r = subprocess.run(cmd_init, env=env, capture_output=True, text=True,
+                        encoding="utf-8", errors="replace", timeout=900)
+    for line in (r.stdout or "").strip().split("\n"):
+        if line.strip(): logger.log(line)
+    if r.returncode != 0:
+        logger.log("⚠ " + (r.stderr or "")[:500])
+        raise RuntimeError("Échec de `react-native init` — voir logs ci-dessus (souvent un souci réseau npm).")
+
+    logger.log("📥 Installation de react-native-webview (npm install)...")
+    r = subprocess.run([npm, "install", f"react-native-webview@{REACT_NATIVE_WEBVIEW_VERSION}", "--save"],
+                        cwd=str(proj), env=env, capture_output=True, text=True,
+                        encoding="utf-8", errors="replace", timeout=600)
+    for line in (r.stdout or "").strip().split("\n"):
+        if line.strip(): logger.log(line)
+    if r.returncode != 0:
+        logger.log("⚠ " + (r.stderr or "")[:500])
+        raise RuntimeError("Échec de `npm install react-native-webview` — voir logs ci-dessus.")
+
+    if source_mode == "scratch":
+        # ── Site local zippé : extrait directement dans les assets
+        # Android natifs (packagés dans l'APK par Gradle sans config
+        # supplémentaire), puis chargé via file:///android_asset/ — pas
+        # de mécanisme de bundling déclaratif côté RN comme pubspec.yaml,
+        # donc on passe par le dossier assets/ natif comme pour Cordova
+        # www/, mêmes conventions d'extraction (remontée d'un niveau si
+        # tout est dans un unique sous-dossier) ──────────────────────────
+        logger.log("🗂 Extraction du site local (zip)...")
+        assets_www = proj / "android" / "app" / "src" / "main" / "assets" / "www"
+        assets_www.mkdir(parents=True, exist_ok=True)
+        zpath = proj / "site_upload.zip"
+        zpath.write_bytes(site_zip_bytes)
+        with zipfile.ZipFile(zpath) as zf:
+            _safe_extract_zip(zf, assets_www, logger)
+        children = list(assets_www.iterdir())
+        if len(children) == 1 and children[0].is_dir() and not (assets_www / "index.html").exists():
+            inner = children[0]
+            for item in inner.iterdir():
+                shutil.move(str(item), str(assets_www / item.name))
+            inner.rmdir()
+        zpath.unlink(missing_ok=True)
+        if not (assets_www / "index.html").exists():
+            raise RuntimeError("Pas d'index.html trouvé à la racine du zip fourni (ni dans un unique sous-dossier).")
+        logger.log("✅ Site local extrait dans android/app/src/main/assets/www/ (app 100% hors-ligne)")
+
+    # ── App.tsx (ou App.js selon la version du template) : remplace
+    # l'écran de démarrage par une WebView plein écran ──────────────────
+    entry = proj / "App.tsx"
+    if not entry.exists():
+        entry = proj / "App.js"
+    if source_mode == "scratch":
+        webview_source = "{{ uri: 'file:///android_asset/www/index.html' }}"
+    else:
+        webview_source = f"{{{{ uri: {json.dumps(url)} }}}}"
+    app_source = f'''import React from 'react';
+import {{ SafeAreaView, StatusBar, StyleSheet }} from 'react-native';
+import {{ WebView }} from 'react-native-webview';
+
+function App() {{
+  return (
+    <SafeAreaView style={{styles.container}}>
+      <StatusBar barStyle="dark-content" />
+      <WebView source={webview_source} style={{styles.webview}} allowFileAccess={{true}} />
+    </SafeAreaView>
+  );
+}}
+
+const styles = StyleSheet.create({{
+  container: {{ flex: 1, backgroundColor: '#fff' }},
+  webview: {{ flex: 1 }},
+}});
+
+export default App;
+'''
+    entry.write_text(app_source, encoding="utf-8")
+    logger.log(f"✅ {entry.name} généré (WebView plein écran vers " + ("le site local embarqué" if source_mode == "scratch" else "le site") + ")")
+
+    # ── strings.xml : nom affiché de l'app ──────────────────────────────
+    strings_path = proj / "android" / "app" / "src" / "main" / "res" / "values" / "strings.xml"
+    if strings_path.exists():
+        content = strings_path.read_text(encoding="utf-8")
+        content = re.sub(r'(<string name="app_name">)[^<]*(</string>)',
+                          rf'\1{app_name}\2', content, count=1)
+        strings_path.write_text(content, encoding="utf-8")
+
+    # ── android/app/build.gradle : version affichée dans le Play Store /
+    # sur l'appareil (versionCode/versionName) ──────────────────────────
+    build_gradle_path = proj / "android" / "app" / "build.gradle"
+    if build_gradle_path.exists():
+        content = build_gradle_path.read_text(encoding="utf-8")
+        content = re.sub(r'versionCode\s+\d+', f'versionCode {version_code}', content, count=1)
+        content = re.sub(r'versionName\s+"[^"]*"', f'versionName "{version_name}"', content, count=1)
+        build_gradle_path.write_text(content, encoding="utf-8")
+        logger.log("✅ build.gradle patché (versionCode/versionName)")
+
+    # ── Icônes : le template RN utilise des icônes adaptatives (XML sous
+    # mipmap-anydpi-v26 référençant foreground/background séparés) qu'on
+    # ne recompose pas ici — on supprime ce dossier pour forcer Android à
+    # retomber sur les PNG classiques qu'on écrit ensuite, plus simple et
+    # fiable qu'une recomposition XML de l'icône adaptative. ────────────
+    anydpi_dir = proj / "android" / "app" / "src" / "main" / "res" / "mipmap-anydpi-v26"
+    if anydpi_dir.exists():
+        shutil.rmtree(anydpi_dir)
+    res_dir = proj / "android" / "app" / "src" / "main" / "res"
+    written = 0
+    for density_dir, size in RN_ICON_DENSITIES.items():
+        target_dir = res_dir / density_dir
+        target_dir.mkdir(parents=True, exist_ok=True)
+        png = make_icon_png(icon_bytes, size)
+        (target_dir / "ic_launcher.png").write_bytes(png)
+        (target_dir / "ic_launcher_round.png").write_bytes(png)
+        written += 1
+    logger.log(f"✅ Icônes générées ({written} densités, icône adaptative désactivée au profit du PNG classique)")
+
+    if splash_bytes:
+        _rn_write_splash(proj, splash_bytes, logger)
+
+    write_hybrid_session_meta(sid, "reactnative", config)
+    return proj
+
+
+def _find_rn_project_root(extract_dir):
+    """
+    Cherche un package.json accompagné d'un dossier android/ (signature
+    d'un projet React Native, un simple package.json ne suffit pas à le
+    distinguer d'un projet Node quelconque) à la racine du zip importé,
+    ou un niveau plus bas — même logique de remontée que les autres
+    modes template.
+    """
+    def _looks_like_rn(d):
+        return (d / "package.json").exists() and (d / "android").is_dir()
+    if _looks_like_rn(extract_dir):
+        return extract_dir
+    children = [p for p in extract_dir.iterdir() if p.is_dir()]
+    if len(children) == 1 and _looks_like_rn(children[0]):
+        return children[0]
+    return None
+
+
+def generate_react_native_project_from_template(sid, config, icon_bytes, splash_bytes, project_zip_bytes, logger):
+    """
+    Mode "template" : importe un projet React Native EXISTANT (zippé) au
+    lieu d'en générer un vierge. On ne touche PAS au package Java /
+    applicationId déjà en place — on ne patch que ce que l'utilisateur a
+    explicitement renseigné (nom affiché, version, icône), même prudence
+    que les modes template Cordova/Flutter. Si node_modules/ est absent
+    du zip (cas fréquent — dossier volumineux souvent exclu à l'export),
+    on relance `npm install` avant de rendre la main.
+    """
+    if not project_zip_bytes:
+        raise RuntimeError("Mode template : un zip du projet React Native existant est requis.")
+
+    proj = react_native_project_dir(sid)
+    if proj.exists():
+        shutil.rmtree(proj)
+    proj.parent.mkdir(parents=True, exist_ok=True)
+    proj.mkdir(parents=True, exist_ok=True)
+
+    logger.log("🗂 Extraction du projet React Native importé (zip)...")
+    zpath = proj.parent / "rn_template_upload.zip"
+    zpath.write_bytes(project_zip_bytes)
+    extract_tmp = proj.parent / "rn_template_extract"
+    shutil.rmtree(extract_tmp, ignore_errors=True)
+    extract_tmp.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zpath) as zf:
+        _safe_extract_zip(zf, extract_tmp, logger)
+    zpath.unlink(missing_ok=True)
+
+    root = _find_rn_project_root(extract_tmp)
+    if not root:
+        shutil.rmtree(extract_tmp, ignore_errors=True)
+        raise RuntimeError(
+            "package.json + dossier android/ introuvables dans le zip importé (ni à la racine, "
+            "ni dans un unique sous-dossier) — ce n'est pas un projet React Native valide."
+        )
+    for item in root.iterdir():
+        shutil.move(str(item), str(proj / item.name))
+    shutil.rmtree(extract_tmp, ignore_errors=True)
+    logger.log(f"✅ Projet importé ({(proj / 'package.json').stat().st_size} octets de package.json)")
+
+    # ── Patch OPTIONNEL : uniquement les champs explicitement renseignés ──
+    app_name_override = (config.get("appName") or "").strip()
+    version_override = (config.get("versionName") or "").strip()
+    version_code_override = config.get("versionCode")
+    if app_name_override:
+        strings_path = proj / "android" / "app" / "src" / "main" / "res" / "values" / "strings.xml"
+        if strings_path.exists():
+            content = strings_path.read_text(encoding="utf-8")
+            content = re.sub(r'(<string name="app_name">)[^<]*(</string>)',
+                              rf'\1{app_name_override}\2', content, count=1)
+            strings_path.write_text(content, encoding="utf-8")
+            logger.log(f"✅ Nom de l'app surchargé : {app_name_override}")
+    if version_override or version_code_override:
+        build_gradle_path = proj / "android" / "app" / "build.gradle"
+        if build_gradle_path.exists():
+            content = build_gradle_path.read_text(encoding="utf-8")
+            if version_code_override:
+                content = re.sub(r'versionCode\s+\d+', f'versionCode {version_code_override}', content, count=1)
+            if version_override:
+                content = re.sub(r'versionName\s+"[^"]*"', f'versionName "{version_override}"', content, count=1)
+            build_gradle_path.write_text(content, encoding="utf-8")
+            logger.log("✅ build.gradle surchargé (version)")
+
+    if icon_bytes:
+        anydpi_dir = proj / "android" / "app" / "src" / "main" / "res" / "mipmap-anydpi-v26"
+        if anydpi_dir.exists():
+            shutil.rmtree(anydpi_dir)
+        res_dir = proj / "android" / "app" / "src" / "main" / "res"
+        written = 0
+        for density_dir, size in RN_ICON_DENSITIES.items():
+            target_dir = res_dir / density_dir
+            target_dir.mkdir(parents=True, exist_ok=True)
+            png = make_icon_png(icon_bytes, size)
+            (target_dir / "ic_launcher.png").write_bytes(png)
+            (target_dir / "ic_launcher_round.png").write_bytes(png)
+            written += 1
+        logger.log(f"✅ Icônes surchargées ({written} densités)")
+
+    if splash_bytes:
+        _rn_write_splash(proj, splash_bytes, logger)
+
+    if not (proj / "node_modules").exists():
+        npm = find_npm()
+        if not npm:
+            raise RuntimeError("npm introuvable — installe le composant 'nodejs' avant de compiler un projet React Native importé.")
+        logger.log("📥 node_modules/ absent du zip importé — installation (npm install)... (peut prendre plusieurs minutes)")
+        env = _rn_env(logger)
+        r = subprocess.run([npm, "install"], cwd=str(proj), env=env, capture_output=True,
+                            text=True, encoding="utf-8", errors="replace", timeout=900)
+        for line in (r.stdout or "").strip().split("\n"):
+            if line.strip(): logger.log(line)
+        if r.returncode != 0:
+            logger.log("⚠ " + (r.stderr or "")[:500])
+            raise RuntimeError("Échec de `npm install` sur le projet importé — voir logs ci-dessus.")
+
+    write_hybrid_session_meta(sid, "reactnative", config)
+    return proj
+
+
+def do_generate_rn_session(config, icon_bytes, splash_bytes=None, site_zip_bytes=None, project_zip_bytes=None):
+    """Génère UNIQUEMENT le projet React Native (pas de build Gradle) —
+    session éditable dans l'explorer avant compilation séparée via
+    /build-rn avec {"session": sid}. Token OPS['rn_gen'].
+    Dispatch sur config['sourceMode'] : 'url' (défaut) / 'scratch' / 'template'."""
+    logger = OPS["rn_gen"] = OpLogger()
+    logger.lines = []; logger.status = "building"; logger.result_file = None
+    sid = new_session_id()
+    logger.session = sid
+    try:
+        source_mode = (config.get("sourceMode") or "url").strip()
+        if source_mode == "template":
+            generate_react_native_project_from_template(sid, config, icon_bytes, splash_bytes, project_zip_bytes, logger)
+        else:
+            generate_react_native_project(sid, config, icon_bytes, splash_bytes, site_zip_bytes, logger)
+        logger.log(f"✅ Projet React Native prêt — session {sid} (modifiable dans l'explorer)")
+        logger.status = "done"
+    except Exception as e:
+        import traceback
+        logger.log(f"❌ Erreur: {e}")
+        logger.log(traceback.format_exc())
+        logger.status = "error"
+
+
+def do_build_react_native(config, icon_bytes, splash_bytes=None, site_zip_bytes=None, project_zip_bytes=None):
+    """
+    Orchestration complète React Native : token OPS['rn'] dédié.
+    Dispatch sur config['sourceMode'] : 'url' (défaut) / 'scratch' / 'template'.
+    Toujours assembleRelease (voir note en tête de section), quelle que
+    soit la signature choisie ensuite — le "debug" ne concerne ici que la
+    clé de signature, pas la variante Gradle compilée.
+    Si config['session'] pointe vers une session déjà générée (via
+    /rn-generate, potentiellement modifiée dans l'explorer), on saute la
+    (re)génération et on compile directement le projet existant.
+    """
+    logger = OPS["rn"] = OpLogger()
+    logger.lines = []; logger.status = "building"; logger.result_file = None
+    existing_sid = (config.get("session") or "").strip()
+    if existing_sid:
+        sid = existing_sid
+        logger.session = sid
+        try:
+            proj = react_native_project_dir(sid)
+            if not proj.exists():
+                raise RuntimeError(f"Session {sid} introuvable ou projet React Native absent — régénère.")
+            logger.log(f"♻ Compilation depuis la session existante {sid} (fichiers tels que modifiés)")
+            android_dir = proj / "android"
+            unsigned_apk = run_gradle_build(android_dir, logger, "assembleRelease")
+            app_name = (config.get("appName") or "MonApp").strip()
+            version_name = str(config.get("versionName") or "1.0")
+            out_name = f"{re.sub(r'[^A-Za-z0-9_.-]', '_', app_name)}_{version_name}_reactnative.apk"
+            min_sdk = config.get("minSdk") or NATIVE_MIN_SDK_DEFAULT
+            signing = config.get("signing", {"mode": "debug"})
+            final_apk = sign_native_apk(unsigned_apk, signing, android_dir, out_name, min_sdk, logger)
+            logger.result_file = str(final_apk)
+            logger.status = "done"
+        except Exception as e:
+            import traceback
+            logger.log(f"❌ Erreur: {e}")
+            logger.log(traceback.format_exc())
+            logger.status = "error"
+        return
+    sid = new_session_id()
+    logger.session = sid
+    try:
+        source_mode = (config.get("sourceMode") or "url").strip()
+        if source_mode == "template":
+            proj = generate_react_native_project_from_template(sid, config, icon_bytes, splash_bytes, project_zip_bytes, logger)
+        else:
+            proj = generate_react_native_project(sid, config, icon_bytes, splash_bytes, site_zip_bytes, logger)
+        android_dir = proj / "android"
+        unsigned_apk = run_gradle_build(android_dir, logger, "assembleRelease")
+
+        app_name = (config.get("appName") or "MonApp").strip()
+        version_name = str(config.get("versionName") or "1.0")
+        out_name = f"{re.sub(r'[^A-Za-z0-9_.-]', '_', app_name)}_{version_name}_reactnative.apk"
+        min_sdk = config.get("minSdk") or NATIVE_MIN_SDK_DEFAULT
+        signing = config.get("signing", {"mode": "debug"})
+
+        final_apk = sign_native_apk(unsigned_apk, signing, android_dir, out_name, min_sdk, logger)
+        logger.result_file = str(final_apk)
+        logger.status = "done"
+    except Exception as e:
+        import traceback
+        logger.log(f"❌ Erreur: {e}")
+        logger.log(traceback.format_exc())
+        logger.status = "error"
+
+
+def do_generate_flutter_session(config, icon_bytes, splash_bytes=None, site_zip_bytes=None, project_zip_bytes=None):
+    """Génère UNIQUEMENT le projet Flutter (pas de build) — session
+    éditable dans l'explorer avant compilation séparée via /build-flutter
+    avec {"session": sid}. Token OPS['flutter_gen'].
+    Dispatch sur config['sourceMode'] : 'url' (défaut) / 'scratch' / 'template'."""
+    logger = OPS["flutter_gen"] = OpLogger()
+    logger.lines = []; logger.status = "building"; logger.result_file = None
+    sid = new_session_id()
+    logger.session = sid
+    try:
+        source_mode = (config.get("sourceMode") or "url").strip()
+        if source_mode == "template":
+            generate_flutter_project_from_template(sid, config, icon_bytes, splash_bytes, project_zip_bytes, logger)
+        else:
+            generate_flutter_project(sid, config, icon_bytes, splash_bytes, site_zip_bytes, logger)
+        logger.log(f"✅ Projet Flutter prêt — session {sid} (modifiable dans l'explorer)")
+        logger.status = "done"
+    except Exception as e:
+        import traceback
+        logger.log(f"❌ Erreur: {e}")
+        logger.log(traceback.format_exc())
+        logger.status = "error"
+
+
+def do_build_flutter(config, icon_bytes, splash_bytes=None, site_zip_bytes=None, project_zip_bytes=None):
+    """
+    Orchestration complète Flutter : token OPS['flutter'] dédié.
+    Dispatch sur config['sourceMode'] : 'url' (défaut) / 'scratch' / 'template'.
+    sign_native_apk re-signe l'APK avec notre clé (debug ou perso) même
+    s'il est déjà signé par défaut par le template Flutter — apksigner
+    accepte de re-signer un APK existant sans problème.
+    Si config['session'] pointe vers une session déjà générée (via
+    /flutter-generate, potentiellement modifiée dans l'explorer), on
+    saute la (re)génération et on compile directement le projet existant.
+    """
+    logger = OPS["flutter"] = OpLogger()
+    logger.lines = []; logger.status = "building"; logger.result_file = None
+    existing_sid = (config.get("session") or "").strip()
+    if existing_sid:
+        sid = existing_sid
+        logger.session = sid
+        try:
+            proj = flutter_project_dir(sid)
+            if not proj.exists():
+                raise RuntimeError(f"Session {sid} introuvable ou projet Flutter absent — régénère.")
+            logger.log(f"♻ Compilation depuis la session existante {sid} (fichiers tels que modifiés)")
+            build_type = "debug" if (config.get("signing", {}).get("mode") == "debug") else "release"
+            unsigned_apk = run_flutter_build(proj, logger, build_type)
+            app_name = (config.get("appName") or "MonApp").strip()
+            version_name = str(config.get("versionName") or "1.0")
+            out_name = f"{re.sub(r'[^A-Za-z0-9_.-]', '_', app_name)}_{version_name}_flutter.apk"
+            min_sdk = config.get("minSdk") or FLUTTER_MIN_SDK_DEFAULT
+            signing = config.get("signing", {"mode": "debug"})
+            final_apk = sign_native_apk(unsigned_apk, signing, proj, out_name, min_sdk, logger)
+            logger.result_file = str(final_apk)
+            logger.status = "done"
+        except Exception as e:
+            import traceback
+            logger.log(f"❌ Erreur: {e}")
+            logger.log(traceback.format_exc())
+            logger.status = "error"
+        return
+    sid = new_session_id()
+    logger.session = sid
+    try:
+        source_mode = (config.get("sourceMode") or "url").strip()
+        if source_mode == "template":
+            proj = generate_flutter_project_from_template(sid, config, icon_bytes, splash_bytes, project_zip_bytes, logger)
+        else:
+            proj = generate_flutter_project(sid, config, icon_bytes, splash_bytes, site_zip_bytes, logger)
+        build_type = "debug" if (config.get("signing", {}).get("mode") == "debug") else "release"
+        unsigned_apk = run_flutter_build(proj, logger, build_type)
+
+        app_name = (config.get("appName") or "MonApp").strip()
+        version_name = str(config.get("versionName") or "1.0")
+        out_name = f"{re.sub(r'[^A-Za-z0-9_.-]', '_', app_name)}_{version_name}_flutter.apk"
+        min_sdk = config.get("minSdk") or FLUTTER_MIN_SDK_DEFAULT
+        signing = config.get("signing", {"mode": "debug"})
+
+        final_apk = sign_native_apk(unsigned_apk, signing, proj, out_name, min_sdk, logger)
+        logger.result_file = str(final_apk)
+        logger.status = "done"
+    except Exception as e:
+        import traceback
+        logger.log(f"❌ Erreur: {e}")
+        logger.log(traceback.format_exc())
+        logger.status = "error"
+
+
+def convert_aab_to_universal_apk(aab_path, work_dir, logger):
+    """
+    Convertit un App Bundle (.aab) en un APK universel autonome via
+    bundletool, pour pouvoir ensuite le décompiler (jadx) ou l'importer
+    dans le pipeline apktool (Mode Dev) comme un APK normal.
+    Signe avec debug.keystore (identifiants standards Android) — suffisant
+    puisque l'objectif est l'analyse/l'édition, pas la publication.
+    """
+    bundletool = find_bundletool()
+    if not bundletool:
+        raise RuntimeError(
+            "bundletool introuvable. Installe le composant 'bundletool' depuis "
+            "l'écran des composants pour traiter les fichiers .aab."
+        )
+    java = find_tool("java")
+    if not java:
+        raise RuntimeError("Java non trouvé — installe le composant 'jdk'.")
+
+    debug_ks = TOOLS_DIR / "debug.keystore"
+    if not debug_ks.exists():
+        raise RuntimeError(
+            "debug.keystore introuvable — relance launcher.bat pour le générer "
+            "avant de traiter un .aab."
+        )
+
+    apks_out = work_dir / "bundle.apks"
+    apks_out.unlink(missing_ok=True)
+    logger.log("📦 Conversion App Bundle (.aab) → APK universel via bundletool...")
+    cmd = [java, "-jar", bundletool, "build-apks",
+           "--bundle", str(aab_path), "--output", str(apks_out),
+           "--mode=universal",
+           "--ks", str(debug_ks), "--ks-pass", "pass:android",
+           "--ks-key-alias", "androiddebugkey", "--key-pass", "pass:android",
+           "--overwrite"]
+    ok = run_cmd(cmd, logger, timeout=300)
+    if not ok or not apks_out.exists():
+        raise RuntimeError("Échec de la conversion .aab → APK (voir les logs bundletool ci-dessus).")
+
+    universal_apk = work_dir / "universal.apk"
+    with zipfile.ZipFile(apks_out) as zf:
+        candidates = [n for n in zf.namelist() if n.endswith("universal.apk")]
+        if not candidates:
+            raise RuntimeError("bundletool n'a produit aucun APK universel exploitable.")
+        with zf.open(candidates[0]) as src, open(universal_apk, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+    logger.log(f"✅ APK universel généré depuis le bundle : {universal_apk.name}")
+    return universal_apk
+
+
+def _is_aab_bytes(data):
+    """Détecte un App Bundle même si le fichier a été renommé en .apk :
+    structure ZIP avec BundleConfig.pb / dossiers base-*, split_*."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            names = zf.namelist()
+            return any(n == "BundleConfig.pb" or n.startswith("base/") for n in names)
+    except zipfile.BadZipFile:
+        return False
+
+
+def _inspect_apk_before_jadx(apk_path, logger):
+    """
+    Vérifications préalables pour transformer les échecs jadx opaques en
+    messages clairs, correspondant aux limites connues de l'outil :
+    - fichier corrompu / pas un vrai ZIP
+    - App Bundle (.aab) envoyé sous une extension .apk → signalé (converti
+      automatiquement par l'appelant via bundletool, pas bloqué ici)
+    - split APK (config split sans classes.dex — juste des ressources)
+    - présence de bibliothèques natives .so (jadx les ignorera, c'est normal)
+    Ne bloque QUE sur les cas réellement irrécupérables (zip invalide,
+    split sans code) ; les autres cas (natif, obfuscation, .aab) sont
+    juste annoncés/gérés pour que le résultat ne surprenne pas l'utilisateur.
+    Retourne True si le fichier est un App Bundle.
+    """
+    try:
+        with zipfile.ZipFile(apk_path) as zf:
+            names = zf.namelist()
+            bad = zf.testzip()
+            if bad:
+                raise RuntimeError(f"Archive corrompue (entrée illisible : {bad}).")
+    except zipfile.BadZipFile:
+        raise RuntimeError(
+            "Ce fichier n'est pas un APK/AAB valide (ZIP corrompu ou illisible). "
+            "Re-télécharge-le et réessaie."
+        )
+
+    # App Bundle (.aab) : structure différente d'un APK — pas de classes.dex
+    # à la racine, mais un BundleConfig.pb et des dossiers base/*.
+    is_aab = any(n == "BundleConfig.pb" or n.startswith("base/") for n in names)
+    if is_aab:
+        logger.log("ℹ Fichier détecté comme App Bundle (.aab) — conversion automatique en APK universel...")
+        return True
+
+    has_dex = any(n.endswith(".dex") for n in names)
+    has_manifest = "AndroidManifest.xml" in names
+    if has_manifest and not has_dex:
+        raise RuntimeError(
+            "Cet APK ne contient aucun classes.dex — c'est probablement un "
+            "APK split (config split : langue, densité d'écran ou ABI), pas "
+            "l'APK de base. Décompile plutôt le split 'base.apk' qui contient "
+            "le code."
+        )
+
+    so_files = [n for n in names if n.endswith(".so")]
+    if so_files:
+        logger.log(f"ℹ {len(so_files)} bibliothèque(s) native(s) (.so) détectée(s) — "
+                    "jadx ne les décompile pas, seul le code Java/Kotlin sera visible.")
+    return False
+
+
+def do_jadx_decompile(apk_bytes, logger):
+    """
+    Décompile un APK (ou un App Bundle .aab, converti automatiquement en
+    APK universel via bundletool) en sources Java lisibles via jadx, puis
+    zippe le résultat dans OUTPUT_DIR pour téléchargement — même schéma
+    que les autres opérations (OPS token dédié 'jadx', poll via /status).
+    """
+    logger.lines = []; logger.status = "building"; logger.result_file = None
+    try:
+        jadx = find_jadx()
+        if not jadx:
+            raise RuntimeError(
+                "jadx introuvable. Installe le composant 'jadx' depuis "
+                "l'écran des composants avant de décompiler."
+            )
+        sid = new_session_id()
+        logger.session = sid
+        work = WORK_DIR / sid / "jadx_in"
+        out_dir = WORK_DIR / sid / "jadx_out"
+        work.mkdir(parents=True, exist_ok=True)
+        apk_path = work / "input.apk"
+        apk_path.write_bytes(apk_bytes)
+
+        logger.log("🔍 Vérification de l'APK/AAB avant décompilation...")
+        is_aab = _inspect_apk_before_jadx(apk_path, logger)
+        if is_aab:
+            apk_path = convert_aab_to_universal_apk(apk_path, work, logger)
+
+        logger.log("🔎 Décompilation avec jadx (peut prendre plusieurs minutes sur de gros APK)...")
+        cmd = [jadx, "-d", str(out_dir), "--show-bad-code", str(apk_path)]
+        logger.log(f"$ {' '.join(cmd)}")
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                                encoding="utf-8", errors="replace", timeout=900)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("Timeout jadx (15 min dépassées) — APK trop volumineux.")
+        for line in (r.stdout or "").strip().split("\n"):
+            if line.strip(): logger.log(line)
+        for line in (r.stderr or "").strip().split("\n"):
+            if line.strip(): logger.log("⚠ " + line)
+        # jadx retourne parfois un code != 0 même quand une partie du code a
+        # été décompilée avec succès (classes obfusquées/corrompues) — on ne
+        # bloque donc que si AUCUNE source n'a été produite.
+        if not out_dir.exists() or not any(out_dir.rglob("*.java")):
+            raise RuntimeError(
+                "jadx n'a produit aucune source Java lisible. Cause probable : "
+                "protection/obfuscation forte (ProGuard agressif, R8, packer "
+                "commercial type DexGuard) qui empêche toute reconstruction du code."
+            )
+
+        out_name = f"{apk_path.stem}_jadx_sources.zip"
+        final_zip = OUTPUT_DIR / out_name
+        if final_zip.exists():
+            final_zip.unlink()
+        with zipfile.ZipFile(final_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+            for f in out_dir.rglob("*"):
+                if f.is_file():
+                    zf.write(f, f.relative_to(out_dir))
+
+        logger.result_file = str(final_zip)
+        logger.status = "done"
+        logger.log(f"✅ Sources Java prêtes : {final_zip.name}")
+    except Exception as e:
+        import traceback
+        logger.log(f"❌ Erreur: {e}")
+        logger.log(traceback.format_exc())
+        logger.status = "error"
+
+
+# =============================================================
 # PIPELINE COMPLET — BUILD DEPUIS ZÉRO
 # =============================================================
 def do_build_scratch(config, icon_bytes, splash_bytes, site_zip_bytes):
@@ -2623,7 +5927,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(200); self.send_cors(); self.end_headers()
 
     def do_GET(self):
-        global CURRENT_SESSION
         parsed = urlparse(self.path)
         path   = parsed.path
         qs     = parse_qs(parsed.query)
@@ -2656,8 +5959,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             filename = unquote(path.replace("/download/", ""))
             filepath = OUTPUT_DIR / filename
             if filepath.exists():
+                content_type = "application/zip" if filename.lower().endswith(".zip") \
+                    else "application/vnd.android.package-archive"
                 self.send_response(200)
-                self.send_header("Content-Type", "application/vnd.android.package-archive")
+                self.send_header("Content-Type", content_type)
                 self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
                 self.send_header("Content-Length", str(filepath.stat().st_size))
                 self.send_cors(); self.end_headers()
@@ -2710,6 +6015,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "scratchMode":          True,
                 "adb":                  bool(adb_path),
                 "adbDevices":           adb_devices,
+                "gradle":               bool(find_gradle()),
+                "jadx":                 bool(find_jadx()),
+                "bundletool":           bool(find_bundletool()),
             })
             return
 
@@ -2913,6 +6221,62 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._err(e, 500)
             return
 
+        # ── /agent-overview : vue d'ensemble condensée pour l'assistant IA ──
+        # Utilisé par le mode Agent (agent-engine.js) comme premier appel
+        # systématique sur un projet, pour éviter qu'il "explore à l'aveugle"
+        # avec des dizaines d'allers-retours /tree + /file.
+        if path == "/agent-overview":
+            sid = qs.get("session", [""])[0] or CURRENT_SESSION
+            if not sid:
+                self._err("Aucun projet chargé", 404); return
+            try:
+                self._json(build_project_overview(sid))
+            except Exception as e:
+                self._err(e, 500)
+            return
+
+        # ── /export-zip : télécharge TOUT le projet en cours, y compris
+        # l'historique complet des fichiers générés/modifiés pendant la
+        # session (pas seulement les fichiers de la dernière réponse IA).
+        # Structure du ZIP :
+        #   project/   → état actuel des fichiers éditables
+        #   history/<horodatage>__.../  → chaque écriture successive
+        if path == "/export-zip":
+            sid = qs.get("session", [""])[0] or CURRENT_SESSION
+            if not sid:
+                self._err("Aucun projet chargé", 404); return
+            try:
+                sd = session_dir(sid)
+                if not sd.exists():
+                    self._err("Session introuvable", 404); return
+                root = resolve_session_root(sid)
+                hist_dir = sd / ".history"
+                buf = io.BytesIO()
+                with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                    if root.exists():
+                        for f in root.rglob("*"):
+                            if f.is_file():
+                                zf.write(f, arcname=str(Path("project") / f.relative_to(root)))
+                    if hist_dir.exists():
+                        for f in hist_dir.rglob("*"):
+                            if f.is_file():
+                                zf.write(f, arcname=str(Path("history") / f.relative_to(hist_dir)))
+                    meta_f = sd / "session.json"
+                    if meta_f.exists():
+                        zf.write(meta_f, arcname="session.json")
+                buf.seek(0)
+                data = buf.getvalue()
+                fname = f"projet-{sid}.zip"
+                self.send_response(200)
+                self.send_header("Content-Type", "application/zip")
+                self.send_header("Content-Disposition", f'attachment; filename="{fname}"')
+                self.send_header("Content-Length", str(len(data)))
+                self.send_cors(); self.end_headers()
+                self.wfile.write(data)
+            except Exception as e:
+                self._err(str(e), 500)
+            return
+
         self.send_response(404); self.end_headers()
 
     def do_DELETE(self):
@@ -3042,6 +6406,206 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 daemon=True
             ).start()
             self._json({"started": True})
+            return
+
+        # ── /build-native : génère + compile une app NATIVE (Kotlin/Gradle) ──
+        # depuis zéro, indépendamment du pipeline WebView/smali ci-dessus.
+        if path == "/build-native":
+            op = get_op("native")
+            if op.status == "building":
+                self._err("Build natif déjà en cours", 409); return
+            payload = self._read_json_body()
+            config  = payload.get("config", payload)
+            try:
+                icon_bytes = _safe_b64(payload.get("icon"), "icon")
+            except ValueError as e:
+                self._err(str(e), 400); return
+            threading.Thread(
+                target=do_build_native,
+                args=(config, icon_bytes),
+                daemon=True
+            ).start()
+            self._json({"started": True, "session": "native"})
+            return
+
+        # ── /build-twa : enveloppe un site existant via bubblewrap (TWA) ────
+        if path == "/build-twa":
+            op = get_op("twa")
+            if op.status == "building":
+                self._err("Build TWA déjà en cours", 409); return
+            payload = self._read_json_body()
+            config  = payload.get("config", payload)
+            try:
+                icon_bytes = _safe_b64(payload.get("icon"), "icon")
+            except ValueError as e:
+                self._err(str(e), 400); return
+            threading.Thread(
+                target=do_build_twa,
+                args=(config, icon_bytes),
+                daemon=True
+            ).start()
+            self._json({"started": True, "session": "twa"})
+            return
+
+        # ── /cordova-generate : génère le projet Cordova SANS compiler,
+        # pour permettre l'édition dans l'explorer avant un /build-cordova
+        # ultérieur avec {"session": sid} ────────────────────────────────
+        if path == "/cordova-generate":
+            op = get_op("cordova_gen")
+            if op.status == "building":
+                self._err("Génération Cordova déjà en cours", 409); return
+            payload = self._read_json_body()
+            config  = payload.get("config", payload)
+            try:
+                icon_bytes        = _safe_b64(payload.get("icon"), "icon")
+                splash_bytes      = _safe_b64(payload.get("splash"), "splash")
+                site_zip_bytes    = _safe_b64(payload.get("siteZip"), "siteZip")
+                project_zip_bytes = _safe_b64(payload.get("projectZip"), "projectZip")
+            except ValueError as e:
+                self._err(str(e), 400); return
+            threading.Thread(
+                target=do_generate_cordova_session,
+                args=(config, icon_bytes, splash_bytes, site_zip_bytes, project_zip_bytes),
+                daemon=True
+            ).start()
+            self._json({"started": True, "session": "cordova_gen"})
+            return
+
+        # ── /flutter-generate : génère le projet Flutter SANS compiler ──
+        # (url / scratch / template — voir config.sourceMode)
+        if path == "/flutter-generate":
+            op = get_op("flutter_gen")
+            if op.status == "building":
+                self._err("Génération Flutter déjà en cours", 409); return
+            payload = self._read_json_body()
+            config  = payload.get("config", payload)
+            try:
+                icon_bytes        = _safe_b64(payload.get("icon"), "icon")
+                splash_bytes      = _safe_b64(payload.get("splash"), "splash")
+                site_zip_bytes    = _safe_b64(payload.get("siteZip"), "siteZip")
+                project_zip_bytes = _safe_b64(payload.get("projectZip"), "projectZip")
+            except ValueError as e:
+                self._err(str(e), 400); return
+            threading.Thread(
+                target=do_generate_flutter_session,
+                args=(config, icon_bytes, splash_bytes, site_zip_bytes, project_zip_bytes),
+                daemon=True
+            ).start()
+            self._json({"started": True, "session": "flutter_gen"})
+            return
+
+        # ── /rn-generate : génère le projet React Native SANS compiler ──
+        # (url / scratch / template — voir config.sourceMode)
+        if path == "/rn-generate":
+            op = get_op("rn_gen")
+            if op.status == "building":
+                self._err("Génération React Native déjà en cours", 409); return
+            payload = self._read_json_body()
+            config  = payload.get("config", payload)
+            try:
+                icon_bytes        = _safe_b64(payload.get("icon"), "icon")
+                splash_bytes      = _safe_b64(payload.get("splash"), "splash")
+                site_zip_bytes    = _safe_b64(payload.get("siteZip"), "siteZip")
+                project_zip_bytes = _safe_b64(payload.get("projectZip"), "projectZip")
+            except ValueError as e:
+                self._err(str(e), 400); return
+            threading.Thread(
+                target=do_generate_rn_session,
+                args=(config, icon_bytes, splash_bytes, site_zip_bytes, project_zip_bytes),
+                daemon=True
+            ).start()
+            self._json({"started": True, "session": "rn_gen"})
+            return
+
+        # ── /build-cordova : enveloppe un site dans un vrai projet Cordova ──
+        # (url / scratch / template — voir config.sourceMode)
+        if path == "/build-cordova":
+            op = get_op("cordova")
+            if op.status == "building":
+                self._err("Build Cordova déjà en cours", 409); return
+            payload = self._read_json_body()
+            config  = payload.get("config", payload)
+            try:
+                icon_bytes        = _safe_b64(payload.get("icon"), "icon")
+                splash_bytes      = _safe_b64(payload.get("splash"), "splash")
+                site_zip_bytes    = _safe_b64(payload.get("siteZip"), "siteZip")
+                project_zip_bytes = _safe_b64(payload.get("projectZip"), "projectZip")
+            except ValueError as e:
+                self._err(str(e), 400); return
+            threading.Thread(
+                target=do_build_cordova,
+                args=(config, icon_bytes, splash_bytes, site_zip_bytes, project_zip_bytes),
+                daemon=True
+            ).start()
+            self._json({"started": True, "session": "cordova"})
+            return
+
+        # ── /build-flutter : enveloppe un site dans un vrai projet Flutter ──
+        # (url / scratch / template — voir config.sourceMode)
+        if path == "/build-flutter":
+            op = get_op("flutter")
+            if op.status == "building":
+                self._err("Build Flutter déjà en cours", 409); return
+            payload = self._read_json_body()
+            config  = payload.get("config", payload)
+            try:
+                icon_bytes        = _safe_b64(payload.get("icon"), "icon")
+                splash_bytes      = _safe_b64(payload.get("splash"), "splash")
+                site_zip_bytes    = _safe_b64(payload.get("siteZip"), "siteZip")
+                project_zip_bytes = _safe_b64(payload.get("projectZip"), "projectZip")
+            except ValueError as e:
+                self._err(str(e), 400); return
+            threading.Thread(
+                target=do_build_flutter,
+                args=(config, icon_bytes, splash_bytes, site_zip_bytes, project_zip_bytes),
+                daemon=True
+            ).start()
+            self._json({"started": True, "session": "flutter"})
+            return
+
+        # ── /build-rn : enveloppe un site dans un vrai projet React Native ──
+        # (url / scratch / template — voir config.sourceMode)
+        if path == "/build-rn":
+            op = get_op("rn")
+            if op.status == "building":
+                self._err("Build React Native déjà en cours", 409); return
+            payload = self._read_json_body()
+            config  = payload.get("config", payload)
+            try:
+                icon_bytes        = _safe_b64(payload.get("icon"), "icon")
+                splash_bytes      = _safe_b64(payload.get("splash"), "splash")
+                site_zip_bytes    = _safe_b64(payload.get("siteZip"), "siteZip")
+                project_zip_bytes = _safe_b64(payload.get("projectZip"), "projectZip")
+            except ValueError as e:
+                self._err(str(e), 400); return
+            threading.Thread(
+                target=do_build_react_native,
+                args=(config, icon_bytes, splash_bytes, site_zip_bytes, project_zip_bytes),
+                daemon=True
+            ).start()
+            self._json({"started": True, "session": "rn"})
+            return
+
+        # ── /jadx-decompile : décompile un APK uploadé en sources Java ──────
+        # lisibles (jadx), indépendant des autres pipelines (token OPS 'jadx').
+        if path == "/jadx-decompile":
+            op = get_op("jadx")
+            if op.status == "building":
+                self._err("Décompilation jadx déjà en cours", 409); return
+            payload = self._read_json_body()
+            apk_b64 = payload.get("apk")
+            try:
+                apk_bytes = _safe_b64(apk_b64, "apk")
+            except ValueError as e:
+                self._err(str(e), 400); return
+            if not apk_bytes:
+                self._err("Aucun APK fourni", 400); return
+            threading.Thread(
+                target=do_jadx_decompile,
+                args=(apk_bytes, op),
+                daemon=True
+            ).start()
+            self._json({"started": True, "session": "jadx"})
             return
 
         # ── /build : génère APK depuis template OU from scratch ─────────────
@@ -3289,7 +6853,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             dname        = payload.get("dname",      "CN=App,O=App,C=US")
             validity     = int(payload.get("validity", 10000))
             force_new    = bool(payload.get("forceNew", False))
-            logger       = get_op("keystore-" + new_session_id())
+            # BUG-mem01 — auparavant : get_op("keystore-"+new_session_id()) créait
+            # une PREMIÈRE entrée OPS sous un id jamais utilisé/interrogé, puis un
+            # second id différent était généré plus bas pour le token réellement
+            # renvoyé au client. La première entrée restait orpheline dans OPS
+            # pour toujours (fuite mémoire, un peu plus à chaque création de
+            # keystore). On génère maintenant un seul id, utilisé pour les deux.
+            token        = f"keystore-{new_session_id()}"
+            logger       = get_op(token)
             logger.status = "building"
 
             def _do_ks():
@@ -3371,7 +6942,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     logger.log(f"❌ {e}"); logger.log(traceback.format_exc())
                     logger.status = "error"
             threading.Thread(target=_do_ks, daemon=True).start()
-            token = f"keystore-{new_session_id()}"
             OPS[token] = logger
             self._json({"started": True, "token": token})
             return
@@ -3387,11 +6957,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not apk_name: self._err("apkName manquant", 400); return
             apk_path = OUTPUT_DIR / apk_name
             if not apk_path.exists(): self._err(f"APK introuvable: {apk_name}", 404); return
-            logger = get_op("sign-" + new_session_id())
-            logger.status = "building"
-            # Calculer le token AVANT de démarrer le thread — évite la race condition
-            # où le thread peut s'exécuter et se terminer avant que le token soit calculé
+            # BUG-mem01 — même correction que /create-keystore : un seul token
+            # généré (au lieu de deux), pour ne plus laisser d'entrée OPS
+            # orpheline en mémoire à chaque signature.
             sign_token = f"sign-{new_session_id()}"
+            logger = get_op(sign_token)
+            logger.status = "building"
             OPS[sign_token] = logger
             ks_tmp = WORK_DIR / f"tmp_{apk_name}.keystore"
             if ks_b64: ks_tmp.write_bytes(base64.b64decode(ks_b64))
@@ -3780,7 +7351,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # Pour le keystore DEBUG : mot de passe fixe "android" — pas de saisie
             # Pour un keystore CUSTOM : demander le mot de passe interactivement
             is_debug_ks = (ks_type != "custom")
-            debug_pass  = "android"  # mot de passe standard du debug.keystore Android
 
             if apksigner_bat and os.path.exists(apksigner_bat):
                 bat_lines += [

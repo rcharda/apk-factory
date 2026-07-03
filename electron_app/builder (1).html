@@ -658,64 +658,19 @@
     font-size: 13px;
   }
   #editor-empty .big { font-size: 48px; opacity: .15; }
-  #code-editor-wrap {
-    position: relative;
+  #code-editor {
     width: 100%; height: 100%;
-    display: none; /* devient 'flex' via JS quand un fichier texte est ouvert */
-  }
-  #code-editor, #code-editor-highlight {
-    position: absolute; inset: 0;
-    margin: 0; padding: 16px;
+    background: var(--bg);
+    color: var(--text);
     font-family: var(--mono);
     font-size: 12px;
     line-height: 1.6;
-    tab-size: 2;
-    white-space: pre-wrap;
-    word-break: break-word;
-    box-sizing: border-box;
-    overflow: auto;
     border: none;
-  }
-  #code-editor-highlight {
-    color: var(--text);
-    background: var(--bg);
-    pointer-events: none;
-    z-index: 1;
-  }
-  #code-editor-highlight code { font: inherit; }
-  #code-editor {
-    background: transparent;
-    color: transparent;
-    caret-color: var(--text);
     outline: none;
+    padding: 16px;
     resize: none;
-    z-index: 2;
+    tab-size: 2;
   }
-  #code-editor::selection { background: #2196f355; }
-  /* Coloration syntaxique (tokens générés en JS) */
-  .tok-tag   { color: #e06c75; }
-  .tok-attr  { color: #d19a66; }
-  .tok-str   { color: #98c379; }
-  .tok-num   { color: #d19a66; }
-  .tok-com   { color: #6b7280; font-style: italic; }
-  .tok-kw    { color: #c678dd; }
-  .tok-sel   { color: #61afef; }
-  .tok-prop  { color: #56b6c2; }
-  .tok-punc  { color: #9aa0b0; }
-  /* Boîte de suggestions temps réel (autocomplétion) */
-  #code-suggest-box {
-    display: none; position: fixed; z-index: 50;
-    background: var(--panel2); border: 1px solid var(--border); border-radius: 8px;
-    box-shadow: 0 8px 24px #000a; max-height: 220px; overflow-y: auto;
-    min-width: 180px; font-family: var(--mono); font-size: 12px;
-  }
-  #code-suggest-box.show { display: block; }
-  .code-suggest-item {
-    padding: 6px 10px; cursor: pointer; color: var(--text); display: flex;
-    align-items: center; gap: 8px; white-space: nowrap;
-  }
-  .code-suggest-item .cs-kind { color: var(--text-dim); font-size: 10px; margin-left: auto; }
-  .code-suggest-item:hover, .code-suggest-item.active { background: #2196f333; }
   #img-preview-wrap {
     display: none;
     align-items: center;
@@ -1289,75 +1244,7 @@
     background: var(--panel3); border-radius: 4px; padding: 1px 5px; font-family: var(--mono); font-size: 10.5px;
   }
 
-  /* ============ PREVIEW MODAL (aperçu visuel HTML / image) ============ */
-  #preview-modal-overlay {
-    display: none; position: fixed; inset: 0; background: #000000cc; z-index: 6000;
-    align-items: center; justify-content: center;
-  }
-  #preview-modal-overlay.show { display: flex; }
-  #preview-modal {
-    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
-    width: 92vw; height: 88vh; max-width: 1400px;
-    display: flex; flex-direction: column; overflow: hidden;
-    box-shadow: 0 24px 80px #000c;
-  }
-  #preview-modal-head {
-    display: flex; align-items: center; gap: 10px; padding: 10px 14px;
-    border-bottom: 1px solid var(--border); font-size: 12px; color: var(--text-dim);
-    flex-shrink: 0;
-  }
-  #preview-modal-head .ptitle { font-weight: 600; color: var(--text); }
-  #preview-modal-head .pfile { font-family: var(--mono); color: var(--text-dim); }
-  #preview-refresh-btn {
-    margin-left: auto; background: var(--panel2); border: 1px solid var(--border);
-    border-radius: 6px; color: var(--text-dim); font-size: 12px; padding: 5px 10px; cursor: pointer;
-  }
-  #preview-refresh-btn:hover { background: var(--panel3); color: var(--text); }
-  #preview-close-btn {
-    background: none; border: none; color: var(--text-dim); font-size: 18px;
-    cursor: pointer; line-height: 1; padding: 2px 6px;
-  }
-  #preview-close-btn:hover { color: var(--text); }
-  #preview-device-switch { display: flex; align-items: center; gap: 4px; margin-left: 14px; }
-  .pdev-btn {
-    background: var(--panel2); border: 1px solid var(--border); border-radius: 6px;
-    color: var(--text-dim); font-size: 11.5px; padding: 5px 9px; cursor: pointer;
-  }
-  .pdev-btn:hover { background: var(--panel3); color: var(--text); }
-  .pdev-btn.active { background: #2196f3; color: #fff; border-color: #2196f3; }
-  #preview-rotate-btn {
-    background: var(--panel2); border: 1px solid var(--border); border-radius: 6px;
-    color: var(--text-dim); font-size: 13px; padding: 5px 9px; cursor: pointer;
-  }
-  #preview-rotate-btn:hover { background: var(--panel3); color: var(--text); }
-  #preview-rotate-btn.hidden { display: none; }
-  #preview-modal-body { flex: 1; min-height: 0; position: relative; display: flex; align-items: center; justify-content: center; background: #1a1a22; overflow: auto; }
-  #preview-device-frame {
-    box-sizing: border-box;
-    background: #111; border-radius: 30px; padding: 10px;
-    box-shadow: 0 20px 60px #0009;
-    transition: width .18s ease, height .18s ease;
-    display: flex;
-  }
-  #preview-device-frame.full {
-    width: 100%; height: 100%; border-radius: 0; padding: 0; box-shadow: none; background: #fff;
-  }
-  #preview-device-frame iframe {
-    width: 100%; height: 100%; border: none; display: block;
-    border-radius: inherit; background: #fff;
-  }
-  #preview-image-wrap {
-    width: 100%; height: 100%; display: none; align-items: center; justify-content: center;
-    background: repeating-conic-gradient(#2a2a35 0% 25%, #23232c 0% 50%) 50% / 20px 20px;
-  }
-  #preview-image-full { max-width: 92%; max-height: 92%; object-fit: contain; box-shadow: 0 8px 30px #0008; }
-  #preview-loading {
-    position: absolute; inset: 0; display: none; align-items: center; justify-content: center;
-    background: #0009; color: #fff; font-size: 13px;
-  }
-  #preview-loading.show { display: flex; }
-  .editor-btn.preview-eye { display: none; }
-
+  /* ============ COMPONENTS MODAL ============ */
   #components-modal-overlay {
     display: none;
     position: fixed; inset: 0;
@@ -1911,8 +1798,6 @@
   <div id="center">
     <div id="editor-bar">
       <span id="editor-path">Aucun fichier ouvert</span>
-      <button class="editor-btn preview-eye" id="btn-preview-file" style="display:none" onclick="openPreview()" title="Aperçu visuel">👁 Aperçu</button>
-      <button class="editor-btn" id="btn-ai-generate-file" style="display:none" onclick="openAIForCurrentFile()" title="Générer/compléter ce fichier avec l'IA">✨ IA</button>
       <button class="editor-btn danger" id="btn-delete-file" style="display:none" onclick="deleteCurrentFile()">Supprimer</button>
       <button class="editor-btn save" id="btn-save-file" style="display:none" onclick="saveCurrentFile()">💾 Enregistrer</button>
     </div>
@@ -1922,11 +1807,7 @@
         <div>Sélectionne un fichier dans l'arborescence</div>
         <div style="font-size:11px;color:var(--muted)">ou crée / importe un projet pour commencer</div>
       </div>
-      <div id="code-editor-wrap" style="display:none">
-        <pre id="code-editor-highlight" aria-hidden="true"><code id="code-editor-highlight-code"></code></pre>
-        <textarea id="code-editor" spellcheck="false"></textarea>
-        <div id="code-suggest-box"></div>
-      </div>
+      <textarea id="code-editor" style="display:none" spellcheck="false"></textarea>
       <div id="binary-editor-wrap" style="display:none; flex-direction:column; width:100%; height:100%; box-sizing:border-box;">
         <div id="binary-tabs" style="display:none; gap:6px; padding:8px 12px 0 12px;">
           <button class="editor-btn" id="tab-btn-axml" onclick="switchBinaryTab('axml')">🔤 Chaînes (sûr)</button>
@@ -2255,33 +2136,6 @@
 
 </div>
 
-<!-- PREVIEW MODAL (aperçu visuel HTML / image) -->
-<div id="preview-modal-overlay">
-  <div id="preview-modal">
-    <div id="preview-modal-head">
-      <span class="ptitle">👁 Aperçu</span>
-      <span class="pfile" id="preview-modal-path"></span>
-      <div id="preview-device-switch">
-        <button class="pdev-btn active" data-device="mobile" onclick="setPreviewDevice('mobile')" title="Mobile (360×800)">📱 Mobile</button>
-        <button class="pdev-btn" data-device="tablet" onclick="setPreviewDevice('tablet')" title="Tablette (800×1280)">📲 Tablette</button>
-        <button class="pdev-btn" data-device="full" onclick="setPreviewDevice('full')" title="Plein écran">🖥 Plein</button>
-        <button id="preview-rotate-btn" onclick="rotatePreviewDevice()" title="Pivoter portrait/paysage">⟳</button>
-      </div>
-      <button id="preview-refresh-btn" onclick="openPreview()">🔄 Rafraîchir</button>
-      <button id="preview-close-btn" onclick="closePreview()">✕</button>
-    </div>
-    <div id="preview-modal-body">
-      <div id="preview-device-frame">
-        <iframe id="preview-iframe" sandbox="allow-scripts allow-same-origin" style="display:none"></iframe>
-      </div>
-      <div id="preview-image-wrap">
-        <img id="preview-image-full">
-      </div>
-      <div id="preview-loading">Chargement de l'aperçu…</div>
-    </div>
-  </div>
-</div>
-
 <!-- RENAME MODAL -->
 <div id="rename-modal-overlay">
   <div id="rename-modal">
@@ -2350,13 +2204,6 @@
 
     <!-- Vue Paramètres -->
     <div id="ai-settings-view">
-      <div class="ai-field" style="background:linear-gradient(135deg,rgba(255,140,0,.12),rgba(255,80,0,.05));border:1px solid rgba(255,140,0,.35);border-radius:8px;padding:12px">
-        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-weight:700;font-size:14px">
-          <input type="checkbox" id="ai-autopilot-toggle" onchange="aiSetAutopilot(this.checked)">
-          🚀 Pilote automatique — zéro intervention humaine
-        </label>
-        <div style="font-size:11px;opacity:.8;margin-top:4px">Active en une fois : mode autonome, mode agent (outils réels), aucune confirmation destructive, test USB automatique — et l'IA ne pose plus aucune question, elle choisit elle-même et va jusqu'au bout (création du projet, fichiers, build, APK prêt). Décoche-le si tu veux garder la main sur certaines étapes.</div>
-      </div>
       <div class="ai-field" style="background:rgba(255,255,255,.04);border-radius:8px;padding:10px 12px">
         <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-weight:600">
           <input type="checkbox" id="ai-autonomous-toggle" onchange="localStorage.setItem(AI_LS_AUTONOMOUS, this.checked ? '1':'0'); aiUpdateAutonomousHint();">
@@ -4266,35 +4113,27 @@ async function openFile(path) {
       '<span class="seg-muted">/</span>' + esc(path).replace(/\//g, '<span class="seg-muted">/</span>');
 
     if (data.type === 'text') {
-      document.getElementById('code-editor-wrap').style.display = 'flex';
+      document.getElementById('code-editor').style.display = 'block';
       document.getElementById('binary-editor-wrap').style.display = 'none';
       document.getElementById('img-preview-wrap').style.display = 'none';
       const ta = document.getElementById('code-editor');
       ta.value = data.content;
-      renderCodeHighlight(path);
-      ta.oninput = () => { currentFile.dirty = true; renderCodeHighlight(path); scheduleCodeSuggest(); };
+      ta.oninput = () => { currentFile.dirty = true; };
       document.getElementById('btn-save-file').style.display = 'inline-block';
       document.getElementById('btn-delete-file').style.display = 'inline-block';
-      const isPreviewable = /\.(html?|htm)$/i.test(path);
-      document.getElementById('btn-preview-file').style.display = isPreviewable ? 'inline-block' : 'none';
-      document.getElementById('btn-ai-generate-file').style.display = 'inline-block';
     } else if (data.type === 'image') {
-      document.getElementById('code-editor-wrap').style.display = 'none';
+      document.getElementById('code-editor').style.display = 'none';
       document.getElementById('binary-editor-wrap').style.display = 'none';
       document.getElementById('img-preview-wrap').style.display = 'flex';
       document.getElementById('img-preview').src = `data:${data.mime || 'image/png'};base64,` + data.content;
       document.getElementById('btn-save-file').style.display = 'none';
       document.getElementById('btn-delete-file').style.display = 'inline-block';
-      document.getElementById('btn-preview-file').style.display = 'inline-block';
-      document.getElementById('btn-ai-generate-file').style.display = 'none';
     } else {
       // type === 'binary' : éditeur de string pool AXML (sûr) et/ou hex (avancé)
-      document.getElementById('code-editor-wrap').style.display = 'none';
+      document.getElementById('code-editor').style.display = 'none';
       document.getElementById('img-preview-wrap').style.display = 'none';
       document.getElementById('binary-editor-wrap').style.display = 'flex';
       document.getElementById('btn-delete-file').style.display = 'inline-block';
-      document.getElementById('btn-preview-file').style.display = 'none';
-      document.getElementById('btn-ai-generate-file').style.display = 'none';
 
       currentFile.hexEditable = !!data.hexEditable;
       currentFile.axml = !!data.axml;
@@ -4491,436 +4330,13 @@ async function deleteCurrentFile() {
 function closeEditor() {
   currentFile = null;
   document.getElementById('editor-empty').style.display = 'flex';
-  document.getElementById('code-editor-wrap').style.display = 'none';
+  document.getElementById('code-editor').style.display = 'none';
   document.getElementById('binary-editor-wrap').style.display = 'none';
   document.getElementById('img-preview-wrap').style.display = 'none';
   document.getElementById('editor-path').textContent = 'Aucun fichier ouvert';
   document.getElementById('btn-save-file').style.display = 'none';
   document.getElementById('btn-delete-file').style.display = 'none';
-  document.getElementById('btn-preview-file').style.display = 'none';
-  document.getElementById('btn-ai-generate-file').style.display = 'none';
-  document.getElementById('code-suggest-box').classList.remove('show');
 }
-
-/* ===================================================================
-   ÉDITEUR : coloration syntaxique + auto-complétion en temps réel
-   (HTML/CSS/JS/JSON) — 100% local, sans dépendance externe (app hors-ligne).
-=================================================================== */
-function escHtml(s) {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
-
-function detectCodeLang(path) {
-  const ext = (path.split('.').pop() || '').toLowerCase();
-  if (ext === 'html' || ext === 'htm' || ext === 'xml') return 'html';
-  if (ext === 'css') return 'css';
-  if (['js', 'jsx', 'ts', 'tsx', 'json'].includes(ext)) return 'js';
-  return 'plain';
-}
-
-const JS_KEYWORDS = ['function','return','const','let','var','if','else','for','while','switch','case','break',
-  'continue','new','class','extends','import','export','default','from','try','catch','finally','throw','typeof',
-  'instanceof','in','of','null','undefined','true','false','this','async','await','yield','static','get','set',
-  'super','do','delete','void'];
-const JS_KEYWORD_SET = new Set(JS_KEYWORDS);
-const JS_SNIPPETS = ['console.log','addEventListener','removeEventListener','querySelector','querySelectorAll',
-  'getElementById','fetch','JSON.parse','JSON.stringify','document','window','localStorage','setTimeout',
-  'setInterval','Promise','Array.from','Object.keys','Object.values','Math.round','Math.floor','Math.max','Math.min'];
-const HTML_TAGS = ['div','span','p','a','img','ul','li','ol','table','tr','td','th','thead','tbody','form','input',
-  'button','select','option','textarea','label','h1','h2','h3','h4','h5','h6','header','footer','nav','main',
-  'section','article','aside','style','script','link','meta','title','head','body','html','iframe','video','audio',
-  'source','canvas','svg','path','br','hr','strong','em','b','i','small','code','pre','blockquote'];
-const HTML_ATTRS = ['class','id','style','href','src','alt','title','type','value','placeholder','name','for','rel',
-  'target','width','height','disabled','checked','required','maxlength','min','max','step','pattern','autofocus',
-  'autocomplete','data-','onclick','onchange','oninput','onsubmit'];
-const CSS_PROPS = ['display','position','top','left','right','bottom','width','height','margin','padding','color',
-  'background','background-color','font-size','font-family','font-weight','line-height','border','border-radius',
-  'box-shadow','flex','flex-direction','align-items','justify-content','gap','grid-template-columns','overflow',
-  'text-align','opacity','transition','transform','cursor','z-index','max-width','min-width','max-height','min-height'];
-
-function tokenizeJS(code) {
-  const re = /(\/\/.*$)|(\/\*[\s\S]*?\*\/)|("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)|(\b\d+(?:\.\d+)?\b)|(\b[a-zA-Z_$][\w$]*\b)/gm;
-  let out = '', last = 0, m;
-  while ((m = re.exec(code))) {
-    out += escHtml(code.slice(last, m.index));
-    if (m[1] || m[2]) out += `<span class="tok-com">${escHtml(m[1] || m[2])}</span>`;
-    else if (m[3]) out += `<span class="tok-str">${escHtml(m[3])}</span>`;
-    else if (m[4]) out += `<span class="tok-num">${escHtml(m[4])}</span>`;
-    else if (m[5]) out += JS_KEYWORD_SET.has(m[5]) ? `<span class="tok-kw">${escHtml(m[5])}</span>` : escHtml(m[5]);
-    last = re.lastIndex;
-  }
-  return out + escHtml(code.slice(last));
-}
-
-function tokenizeCSS(code) {
-  const re = /(\/\*[\s\S]*?\*\/)|("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')|([a-zA-Z-]+)(?=\s*:)|(\b\d+(?:\.\d+)?(?:px|em|rem|%|vh|vw|s|ms|deg)?\b)/g;
-  let out = '', last = 0, m;
-  while ((m = re.exec(code))) {
-    out += escHtml(code.slice(last, m.index));
-    if (m[1]) out += `<span class="tok-com">${escHtml(m[1])}</span>`;
-    else if (m[2]) out += `<span class="tok-str">${escHtml(m[2])}</span>`;
-    else if (m[3]) out += `<span class="tok-prop">${escHtml(m[3])}</span>`;
-    else if (m[4]) out += `<span class="tok-num">${escHtml(m[4])}</span>`;
-    last = re.lastIndex;
-  }
-  return out + escHtml(code.slice(last));
-}
-
-function tokenizeHTML(code) {
-  const re = /(<!--[\s\S]*?-->)|(<\/?[a-zA-Z][\w:-]*)|("[^"]*"|'[^']*')|([a-zA-Z_:][\w:.-]*)(?==)|(\/?>)/g;
-  let out = '', last = 0, m;
-  while ((m = re.exec(code))) {
-    out += escHtml(code.slice(last, m.index));
-    if (m[1]) out += `<span class="tok-com">${escHtml(m[1])}</span>`;
-    else if (m[2] || m[5]) out += `<span class="tok-tag">${escHtml(m[2] || m[5])}</span>`;
-    else if (m[3]) out += `<span class="tok-str">${escHtml(m[3])}</span>`;
-    else if (m[4]) out += `<span class="tok-attr">${escHtml(m[4])}</span>`;
-    last = re.lastIndex;
-  }
-  return out + escHtml(code.slice(last));
-}
-
-function renderCodeHighlight(path) {
-  const ta = document.getElementById('code-editor');
-  const hl = document.getElementById('code-editor-highlight-code');
-  if (!ta || !hl) return;
-  const lang = detectCodeLang(path || '');
-  const code = ta.value;
-  let html;
-  if (lang === 'js') html = tokenizeJS(code);
-  else if (lang === 'css') html = tokenizeCSS(code);
-  else if (lang === 'html') html = tokenizeHTML(code);
-  else html = escHtml(code);
-  hl.innerHTML = html + '\n';
-  syncCodeScroll();
-}
-
-function syncCodeScroll() {
-  const ta = document.getElementById('code-editor');
-  const pre = document.getElementById('code-editor-highlight');
-  if (!ta || !pre) return;
-  pre.scrollTop = ta.scrollTop;
-  pre.scrollLeft = ta.scrollLeft;
-}
-
-// Conversion position texte → coordonnées pixel dans le textarea (technique
-// du "div miroir"), utilisée pour positionner la boîte de suggestions.
-function getCaretCoordinates(textarea, position) {
-  const mirror = document.createElement('div');
-  const style = getComputedStyle(textarea);
-  ['boxSizing','width','fontFamily','fontSize','fontWeight','lineHeight','padding','border','whiteSpace','tabSize']
-    .forEach(p => mirror.style[p] = style[p]);
-  Object.assign(mirror.style, { position: 'absolute', visibility: 'hidden', whiteSpace: 'pre-wrap',
-    wordWrap: 'break-word', top: '0', left: '-9999px', height: 'auto' });
-  document.body.appendChild(mirror);
-  mirror.textContent = textarea.value.substring(0, position);
-  const span = document.createElement('span');
-  span.textContent = textarea.value.substring(position) || '.';
-  mirror.appendChild(span);
-  const coords = { left: span.offsetLeft, top: span.offsetTop };
-  document.body.removeChild(mirror);
-  return coords;
-}
-
-function getCurrentCodeWord(text, pos) {
-  const before = text.slice(0, pos);
-  const m = before.match(/[\w$-]*$/);
-  return m ? m[0] : '';
-}
-
-function collectDocWords(code) {
-  return Array.from(new Set(code.match(/[a-zA-Z_$][\w$-]{2,}/g) || []));
-}
-
-let codeSuggestTimer = null;
-let codeSuggestItems = [];
-let codeSuggestActive = -1;
-
-function scheduleCodeSuggest() {
-  clearTimeout(codeSuggestTimer);
-  codeSuggestTimer = setTimeout(showCodeSuggestions, 120);
-}
-
-function showCodeSuggestions() {
-  if (!currentFile || currentFile.type !== 'text') { closeCodeSuggest(); return; }
-  const ta = document.getElementById('code-editor');
-  const pos = ta.selectionStart;
-  const text = ta.value;
-  const word = getCurrentCodeWord(text, pos);
-  if (word.length < 2) { closeCodeSuggest(); return; }
-
-  const lang = detectCodeLang(currentFile.path);
-  let pool = [];
-  if (lang === 'html') pool = HTML_TAGS.concat(HTML_ATTRS);
-  else if (lang === 'css') pool = CSS_PROPS;
-  else if (lang === 'js') pool = JS_KEYWORDS.concat(JS_SNIPPETS);
-  pool = pool.concat(collectDocWords(text));
-
-  const lower = word.toLowerCase();
-  const matches = Array.from(new Set(pool))
-    .filter(w => w.toLowerCase().startsWith(lower) && w.toLowerCase() !== lower)
-    .slice(0, 8);
-
-  if (!matches.length) { closeCodeSuggest(); return; }
-  codeSuggestItems = matches;
-  codeSuggestActive = 0;
-  renderCodeSuggestBox();
-}
-
-function renderCodeSuggestBox() {
-  const box = document.getElementById('code-suggest-box');
-  box.innerHTML = codeSuggestItems.map((w, i) =>
-    `<div class="code-suggest-item${i === 0 ? ' active' : ''}" onmousedown="acceptCodeSuggest(${i})">${esc(w)}</div>`
-  ).join('');
-  box.classList.add('show');
-  const ta = document.getElementById('code-editor');
-  const coords = getCaretCoordinates(ta, ta.selectionStart);
-  const rect = ta.getBoundingClientRect();
-  box.style.left = Math.min(rect.left + coords.left - ta.scrollLeft, window.innerWidth - 200) + 'px';
-  box.style.top = (rect.top + coords.top - ta.scrollTop + 18) + 'px';
-}
-
-function closeCodeSuggest() {
-  document.getElementById('code-suggest-box').classList.remove('show');
-  codeSuggestItems = [];
-  codeSuggestActive = -1;
-}
-
-function acceptCodeSuggest(i) {
-  const ta = document.getElementById('code-editor');
-  const pos = ta.selectionStart;
-  const text = ta.value;
-  const word = getCurrentCodeWord(text, pos);
-  const replacement = codeSuggestItems[i];
-  if (replacement === undefined) return;
-  ta.value = text.slice(0, pos - word.length) + replacement + text.slice(pos);
-  const newPos = pos - word.length + replacement.length;
-  ta.selectionStart = ta.selectionEnd = newPos;
-  if (currentFile) { currentFile.dirty = true; renderCodeHighlight(currentFile.path); }
-  closeCodeSuggest();
-  ta.focus();
-}
-
-// Initialisation unique des interactions clavier/scroll de l'éditeur
-(function initCodeEditorUX() {
-  const ta = document.getElementById('code-editor');
-  if (!ta) return;
-  ta.addEventListener('scroll', syncCodeScroll);
-  ta.addEventListener('click', closeCodeSuggest);
-  ta.addEventListener('blur', () => setTimeout(closeCodeSuggest, 150));
-  ta.addEventListener('keydown', (e) => {
-    const box = document.getElementById('code-suggest-box');
-    const suggestOpen = box.classList.contains('show');
-    if (suggestOpen && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
-      e.preventDefault();
-      const items = box.querySelectorAll('.code-suggest-item');
-      if (!items.length) return;
-      items[codeSuggestActive] && items[codeSuggestActive].classList.remove('active');
-      codeSuggestActive = e.key === 'ArrowDown'
-        ? (codeSuggestActive + 1) % items.length
-        : (codeSuggestActive - 1 + items.length) % items.length;
-      items[codeSuggestActive].classList.add('active');
-      items[codeSuggestActive].scrollIntoView({ block: 'nearest' });
-      return;
-    }
-    if (suggestOpen && (e.key === 'Enter' || e.key === 'Tab')) {
-      e.preventDefault();
-      acceptCodeSuggest(codeSuggestActive >= 0 ? codeSuggestActive : 0);
-      return;
-    }
-    if (suggestOpen && e.key === 'Escape') { closeCodeSuggest(); return; }
-    if (e.key === 'Tab') {
-      e.preventDefault();
-      const pos = ta.selectionStart;
-      ta.value = ta.value.slice(0, pos) + '  ' + ta.value.slice(ta.selectionEnd);
-      ta.selectionStart = ta.selectionEnd = pos + 2;
-      if (currentFile) { currentFile.dirty = true; renderCodeHighlight(currentFile.path); }
-    }
-  });
-})();
-
-// Raccourci "✨ IA" dans la barre de l'éditeur : ouvre le Code Factory (IA)
-// avec un prompt pré-rempli en fonction du fichier ouvert, prêt à envoyer.
-function openAIForCurrentFile() {
-  if (!currentFile) return;
-  const prompt = `Complète/améliore le fichier "${currentFile.path}" de ce projet (site web complet : structure HTML, style CSS, interactions JS). Regarde le reste du projet si besoin (search_project / read_file), puis écris le résultat avec write_file.`;
-  openAIPanel();
-  const input = document.getElementById('ai-input-text');
-  if (input) { input.value = prompt; input.focus(); }
-}
-
-/* ===================================================================
-   APERÇU VISUEL (👁) — HTML rendu dans un iframe (assets relatifs
-   CSS/JS/images inlinés pour un rendu fidèle) et images en plein écran.
-=================================================================== */
-async function fetchProjectFile(path) {
-  try {
-    const r = await fetch('/file?path=' + encodeURIComponent(path));
-    const data = await r.json();
-    if (data.error) return null;
-    return data;
-  } catch (e) { return null; }
-}
-
-// Résout un chemin relatif (href/src) par rapport au dossier du fichier HTML
-// courant. Retourne null pour les URLs externes/absolues (http, //, data:, #)
-// qu'on laisse l'iframe charger telles quelles.
-function joinRelPath(baseDir, rel) {
-  if (!rel || /^([a-z][a-z0-9+.-]*:)?\/\//i.test(rel) || rel.startsWith('data:') || rel.startsWith('#')) return null;
-  const parts = rel.startsWith('/')
-    ? rel.slice(1).split('/')
-    : (baseDir ? baseDir.split('/') : []).concat(rel.split('/'));
-  const stack = [];
-  for (const p of parts) {
-    if (p === '' || p === '.') continue;
-    if (p === '..') stack.pop();
-    else stack.push(p);
-  }
-  return stack.join('/');
-}
-
-async function buildInlinedHtml(htmlText, baseDir) {
-  const doc = new DOMParser().parseFromString(htmlText, 'text/html');
-
-  // <link rel="stylesheet" href="..."> → <style> inline
-  for (const link of Array.from(doc.querySelectorAll('link[rel="stylesheet"][href]'))) {
-    const rp = joinRelPath(baseDir, link.getAttribute('href'));
-    if (!rp) continue;
-    const data = await fetchProjectFile(rp);
-    if (data && data.type === 'text') {
-      const style = doc.createElement('style');
-      style.textContent = data.content;
-      link.replaceWith(style);
-    }
-  }
-
-  // <script src="..."> → <script> inline (contenu du même dossier)
-  for (const script of Array.from(doc.querySelectorAll('script[src]'))) {
-    const rp = joinRelPath(baseDir, script.getAttribute('src'));
-    if (!rp) continue;
-    const data = await fetchProjectFile(rp);
-    if (data && data.type === 'text') {
-      const inline = doc.createElement('script');
-      inline.textContent = data.content;
-      script.replaceWith(inline);
-    }
-  }
-
-  // <img src="..."> → data: URI base64
-  for (const img of Array.from(doc.querySelectorAll('img[src]'))) {
-    const rp = joinRelPath(baseDir, img.getAttribute('src'));
-    if (!rp) continue;
-    const data = await fetchProjectFile(rp);
-    if (data && data.type === 'image') {
-      img.setAttribute('src', `data:${data.mime || 'image/png'};base64,` + data.content);
-    }
-  }
-
-  return '<!DOCTYPE html>\n' + doc.documentElement.outerHTML;
-}
-
-// Tailles d'appareils Android courantes pour l'aperçu (en CSS px, ~1:1 dp).
-const PREVIEW_DEVICE_SIZES = {
-  mobile: { w: 360, h: 800 },   // téléphone Android compact
-  tablet: { w: 800, h: 1280 },  // tablette 10"
-};
-let previewDeviceState = { type: 'mobile', orientation: 'portrait' };
-
-function setPreviewDevice(type) {
-  previewDeviceState.type = type;
-  document.querySelectorAll('.pdev-btn').forEach(b => b.classList.toggle('active', b.dataset.device === type));
-  document.getElementById('preview-rotate-btn').classList.toggle('hidden', type === 'full');
-  applyDeviceFrameSize();
-}
-
-function rotatePreviewDevice() {
-  previewDeviceState.orientation = previewDeviceState.orientation === 'portrait' ? 'landscape' : 'portrait';
-  applyDeviceFrameSize();
-}
-
-function applyDeviceFrameSize() {
-  const frame = document.getElementById('preview-device-frame');
-  const body = document.getElementById('preview-modal-body');
-  if (previewDeviceState.type === 'full') {
-    frame.classList.add('full');
-    frame.style.width = '';
-    frame.style.height = '';
-    frame.style.transform = '';
-    return;
-  }
-  frame.classList.remove('full');
-  let { w, h } = PREVIEW_DEVICE_SIZES[previewDeviceState.type];
-  if (previewDeviceState.orientation === 'landscape') { const t = w; w = h; h = t; }
-  frame.style.width = w + 'px';
-  frame.style.height = h + 'px';
-  // Mise à l'échelle pour que le cadre tienne dans la modale, quelle que
-  // soit la taille de fenêtre (mobile/tablette dépassent souvent la hauteur
-  // dispo à l'échelle 1:1).
-  const availW = body.clientWidth - 48;
-  const availH = body.clientHeight - 48;
-  const scale = Math.min(1, availW / w, availH / h);
-  frame.style.transform = `scale(${scale})`;
-}
-
-window.addEventListener('resize', () => {
-  if (document.getElementById('preview-modal-overlay').classList.contains('show')) applyDeviceFrameSize();
-});
-
-async function openPreview() {
-  if (!currentFile) return;
-  const overlay   = document.getElementById('preview-modal-overlay');
-  const loading   = document.getElementById('preview-loading');
-  const iframe    = document.getElementById('preview-iframe');
-  const frame     = document.getElementById('preview-device-frame');
-  const devSwitch = document.getElementById('preview-device-switch');
-  const imgWrap   = document.getElementById('preview-image-wrap');
-  const imgFull   = document.getElementById('preview-image-full');
-
-  document.getElementById('preview-modal-path').textContent = currentFile.path;
-  overlay.classList.add('show');
-  loading.classList.add('show');
-  iframe.style.display = 'none';
-  imgWrap.style.display = 'none';
-
-  if (currentFile.type === 'image') {
-    devSwitch.style.display = 'none';
-    frame.style.display = 'none';
-    imgFull.src = document.getElementById('img-preview').src;
-    imgWrap.style.display = 'flex';
-    loading.classList.remove('show');
-    return;
-  }
-
-  devSwitch.style.display = 'flex';
-  frame.style.display = 'flex';
-  applyDeviceFrameSize();
-
-  // Aperçu du contenu ACTUEL de l'éditeur (même pas encore enregistré)
-  const htmlText = document.getElementById('code-editor').value;
-  const baseDir = currentFile.path.includes('/')
-    ? currentFile.path.slice(0, currentFile.path.lastIndexOf('/'))
-    : '';
-  try {
-    iframe.srcdoc = await buildInlinedHtml(htmlText, baseDir);
-  } catch (e) {
-    iframe.srcdoc = '<pre style="color:#c00;padding:16px;font-family:monospace">Erreur de rendu de l\'aperçu :\n' + String(e) + '</pre>';
-  } finally {
-    iframe.style.display = 'block';
-    loading.classList.remove('show');
-  }
-}
-
-function closePreview() {
-  document.getElementById('preview-modal-overlay').classList.remove('show');
-  document.getElementById('preview-iframe').srcdoc = '';
-}
-
-document.getElementById('preview-modal-overlay').addEventListener('click', (e) => {
-  if (e.target.id === 'preview-modal-overlay') closePreview();
-});
-document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') closePreview();
-});
 
 async function promptNewFile() {
   if (!projectLoaded) { toast("Ouvre un projet d'abord", 'err'); return; }
@@ -9100,7 +8516,6 @@ const AI_LS_TTS       = 'apkfactory_ai_tts';        // '1' = l'IA lit ses répon
 const AI_LS_TTS_VOICE = 'apkfactory_ai_tts_voice';  // nom de la SpeechSynthesisVoice choisie
 const AI_LS_TTS_RATE  = 'apkfactory_ai_tts_rate';   // vitesse de lecture (0.5 à 1.6)
 const AI_LS_ADB_AUTOTEST = 'apkfactory_adb_autotest'; // '1' = installe+lance auto l'APK dès qu'un appareil ADB est branché
-const AI_LS_AUTOPILOT = 'apkfactory_ai_autopilot';     // '1' = active tout d'un coup + interdit à l'IA de poser des questions
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 const AI_LOCAL_PORT = 8090;
 const AI_LOCAL_URL  = `http://127.0.0.1:${AI_LOCAL_PORT}/v1/chat/completions`;
@@ -9402,26 +8817,9 @@ function aiLoadHistoryForSession(sid) {
 
 // À appeler chaque fois que window._currentSessionId change (nouveau projet
 // chargé, session créée, projet ouvert depuis /sessions...).
-//
-// Cas particulier : l'IA en mode autonome peut créer une session Scratch
-// toute seule (aiEnsureAutonomousSession) alors que le client discutait déjà
-// avec elle SANS projet chargé (aiHistSid === null, historique stocké sous
-// la clé "legacy" apkfactory_ai_history). Avant, ce switch de session
-// chargeait l'historique (vide) de la nouvelle session et remplaçait
-// silencieusement la conversation en cours — donnant l'impression que les
-// messages récents avaient disparu. On migre maintenant l'historique legacy
-// vers la nouvelle session au lieu de l'abandonner.
 function aiOnSessionChanged(sid) {
   if (sid === aiHistSid) return; // déjà sur cette session, rien à faire
-  const previousSid = aiHistSid;
-  const previousHistory = Array.isArray(aiHistory) ? aiHistory.slice() : [];
   aiLoadHistoryForSession(sid);
-  if (sid && !previousSid && previousHistory.length && aiHistory.length === 0) {
-    aiHistory = previousHistory;
-    aiPersistHistory();
-    try { localStorage.removeItem(aiHistKey(previousSid)); } catch (e) {}
-    if (typeof aiRenderHistory === 'function') aiRenderHistory();
-  }
 }
 
 function loadAISettings() {
@@ -9456,30 +8854,6 @@ function loadAISettings() {
     const stored = localStorage.getItem(AI_LS_ADB_AUTOTEST);
     adbAuto.checked = stored === null ? true : stored === '1'; // activé par défaut
     localStorage.setItem(AI_LS_ADB_AUTOTEST, adbAuto.checked ? '1' : '0');
-  }
-
-  const autopilot = document.getElementById('ai-autopilot-toggle');
-  if (autopilot) autopilot.checked = localStorage.getItem(AI_LS_AUTOPILOT) === '1';
-}
-
-// Bascule tout d'un coup : mode autonome, mode agent (outils réels),
-// confirmations destructives désactivées, test USB auto — et pose un
-// indicateur que l'agent lit pour ne plus jamais poser de question.
-function aiSetAutopilot(on) {
-  localStorage.setItem(AI_LS_AUTOPILOT, on ? '1' : '0');
-  if (on) {
-    localStorage.setItem(AI_LS_AUTONOMOUS, '1');
-    localStorage.setItem('apkfactory_agent_enabled', '1');
-    localStorage.setItem('apkfactory_agent_guard', '0');
-    localStorage.setItem(AI_LS_ADB_AUTOTEST, '1');
-    const a = document.getElementById('ai-autonomous-toggle'); if (a) a.checked = true;
-    const g = document.getElementById('agent-toggle-enabled'); if (g) g.checked = true;
-    const guard = document.getElementById('agent-toggle-guard'); if (guard) guard.checked = false;
-    const adb = document.getElementById('ai-adb-autotest-toggle'); if (adb) adb.checked = true;
-    if (typeof aiUpdateAutonomousHint === 'function') aiUpdateAutonomousHint();
-    if (typeof toast === 'function') toast('🚀 Pilote automatique activé — l\'IA ne posera plus de question et ira jusqu\'au bout toute seule.', 'ok');
-  } else if (typeof toast === 'function') {
-    toast('Pilote automatique désactivé — tu gardes la main sur les questions/confirmations.', 'ok');
   }
 }
 
@@ -10007,11 +9381,9 @@ function aiRenderMessageBody(div, content) {
   const parts = String(content).split(/```(\w*)\n?([\s\S]*?)```/g);
   let fileBlockCount = 0;
   const collectedFiles = [];
-  let charOffset = 0; // position dans `content` d'origine, pour retrouver le texte qui précède chaque bloc
 
   for (let i = 0; i < parts.length; i++) {
     if (i % 3 === 0) {
-      charOffset += parts[i].length + 3; // + les 3 backticks d'ouverture du bloc suivant
       if (parts[i].trim()) {
         const t = document.createElement('div');
         t.className = 'ai-msg-text';
@@ -10021,25 +9393,14 @@ function aiRenderMessageBody(div, content) {
     } else if (i % 3 === 1) {
       const lang = parts[i] || 'txt';
       let code = parts[i + 1] || '';
-      charOffset += (parts[i] || '').length + 1 + code.length + 3; // langage + \n + code + ``` fermants
       i++;
 
-      // Même détection à 3 niveaux que aiExtractFileBlocks (FILE: tolérant,
-      // nom mentionné juste avant le bloc, ou défaut par langage) — pour que
-      // ce qui s'affiche corresponde exactement à ce qui sera réellement écrit.
       let suggestedPath = '';
-      const fileMatch = code.match(/^\s*(?:\/\/|#|<!--)?\s*FILE:\s*(\S.*?)(?:-->)?\s*\r?\n/i);
+      const fileMatch = code.match(/^\s*FILE:\s*(\S.*)\r?\n/);
       if (fileMatch) {
         suggestedPath = fileMatch[1].trim();
         code = code.slice(fileMatch[0].length);
         fileBlockCount++;
-      } else {
-        const before = content.slice(Math.max(0, charOffset - code.length - 220), charOffset - code.length);
-        const nameMatch =
-          before.match(/\*\*([A-Za-z0-9_\-./]+\.(?:html?|css|js|xml|kt|java|json|py|dart))\*\*/i) ||
-          before.match(/`([A-Za-z0-9_\-./]+\.(?:html?|css|js|xml|kt|java|json|py|dart))`/i) ||
-          before.match(/([A-Za-z0-9_\-./]+\.(?:html?|css|js|xml|kt|java|json|py|dart))\s*:?\s*$/i);
-        if (nameMatch) { suggestedPath = nameMatch[1].trim(); fileBlockCount++; }
       }
       const defaultPathByLang = {
         html: 'assets/index.html', htm: 'assets/index.html',
@@ -10057,20 +9418,12 @@ function aiRenderMessageBody(div, content) {
       const block = document.createElement('div');
       block.className = 'ai-code-block';
       block.dataset.file = suggestedPath || effectivePath;
-      const autoOn = localStorage.getItem(AI_LS_AUTONOMOUS) === '1';
-      const pilotOn = localStorage.getItem(AI_LS_AUTOPILOT) === '1';
-      const isAuto = autoOn && pilotOn; // exécution immédiate (pilote automatique)
-      const isSemiAuto = autoOn && !pilotOn; // confirmation par boutons à la fin du message
       block.innerHTML = `<div class="ai-code-head">
           <span class="ai-code-lang">${esc(lang || 'txt')}</span>
-          <input type="text" class="ai-file-path" value="${esc(effectivePath)}" title="Chemin d'enregistrement (modifiable)" ${(isAuto || isSemiAuto) ? 'disabled' : ''}>
+          <input type="text" class="ai-file-path" value="${esc(effectivePath)}" title="Chemin d'enregistrement (modifiable)">
           <button onclick="aiCopyCode(this)">📋 Copier</button>
           <button onclick="aiDownloadCodeBlock(this)">💾 Télécharger</button>
-          ${isAuto
-            ? `<span class="ai-auto-applied" style="font-size:11px;opacity:.8;padding:4px 8px;color:var(--accent,#3ddc84)" title="Déjà écrit dans le projet automatiquement (pilote automatique)">✅ Déjà inséré</span>`
-            : isSemiAuto
-              ? `<span style="font-size:11px;opacity:.7;padding:4px 8px" title="Confirmation demandée en bas du message">⏳ Voir confirmation ↓</span>`
-              : `<button onclick="aiInsertCodePrompt(this)">📥 Insérer</button>`}
+          <button onclick="aiInsertCodePrompt(this)">📥 Insérer</button>
         </div>
         <pre><code class="hljs">${aiHighlightCode(code, lang)}</code></pre>
         <div class="ai-code-lines">${nbLines} ligne${nbLines > 1 ? 's' : ''}</div>`;
@@ -10082,16 +9435,12 @@ function aiRenderMessageBody(div, content) {
   // téléchargement direct en .zip (fonctionne même sans projet chargé),
   // en plus de l'insertion directe dans le projet courant.
   if (fileBlockCount > 1) {
-    const autoOn = localStorage.getItem(AI_LS_AUTONOMOUS) === '1';
-    const pilotOn = localStorage.getItem(AI_LS_AUTOPILOT) === '1';
-    const isAuto = autoOn && pilotOn;
-    const isSemiAuto = autoOn && !pilotOn;
     const box = document.createElement('div');
     box.className = 'ai-files-summary';
-    box.innerHTML = `<div class="ai-files-summary-head">📦 ${fileBlockCount} fichiers générés${isAuto ? ' — déjà insérés automatiquement ✅' : isSemiAuto ? ' — confirmation demandée en bas du message ⏳' : ''}</div>
+    box.innerHTML = `<div class="ai-files-summary-head">📦 ${fileBlockCount} fichiers générés</div>
       <ul>${collectedFiles.map(f => `<li>📄 ${esc(f.path)}</li>`).join('')}</ul>
       <div class="ai-files-summary-actions">
-        ${(isAuto || isSemiAuto) ? '' : `<button onclick="aiInsertAllFiles(this)">📥 Insérer dans le projet</button>`}
+        <button onclick="aiInsertAllFiles(this)">📥 Insérer dans le projet</button>
         <button class="secondary" onclick="aiDownloadAllFiles(this)">⬇ Télécharger le .zip</button>
       </div>`;
     div.appendChild(box);
@@ -10253,33 +9602,10 @@ async function aiSaveFileToProject(target, code) {
 async function aiEnsureAutonomousSession() {
   if (window._currentSessionId) return window._currentSessionId;
   const htmlField = document.getElementById('htmlContent');
-  const urlField = document.getElementById('appUrl');
-  const hasUrl = !!(urlField && urlField.value.trim());
-  // Le HTML est considéré "fourni" seulement s'il a été explicitement rempli
-  // par le client/l'IA — pas si c'est déjà le squelette vide qu'on génère
-  // nous-même juste en dessous.
-  const hasCustomHtml = !!(htmlField && htmlField.value.trim() && !htmlField.dataset.autofilled);
-  if (hasUrl && hasCustomHtml) {
-    // Les deux sont fournis : impossible de deviner l'intention du client
-    // sans se tromper une fois sur deux (site distant OU app HTML locale ?).
-    // On ne choisit PAS silencieusement — on remonte une erreur explicite
-    // que l'IA doit lire et transformer en question posée au client
-    // ("Tu veux charger l'URL X, ou plutôt le HTML que tu m'as donné ?").
-    throw new Error(
-      "Ambigu : une URL (" + urlField.value.trim() + ") ET du contenu HTML personnalisé sont " +
-      "tous les deux renseignés. Demande au client lequel utiliser (l'URL distante, le HTML local, " +
-      "ou les deux via un bouton/lien de bascule dans le HTML), avant de créer le projet."
-    );
-  }
   if (htmlField && !htmlField.value.trim()) {
     htmlField.value = '<!DOCTYPE html>\n<html>\n<head><meta charset="utf-8"><title>App</title></head>\n<body></body>\n</html>';
-    htmlField.dataset.autofilled = '1';
   }
-  // Par défaut, sur N'IMPORTE QUEL type d'APK (scratch, cordova, flutter,
-  // react native, native, twa...) : si aucune URL n'est donnée, on part en
-  // mode HTML local plutôt qu'en mode URL avec une valeur par défaut
-  // trompeuse (https://example.com).
-  if (typeof currentMode !== 'undefined' && !hasUrl) {
+  if (typeof currentMode !== 'undefined' && currentMode === 'url' && !(document.getElementById('appUrl')?.value.trim())) {
     currentMode = 'html';
   }
   const config = collectConfig();
@@ -10318,58 +9644,16 @@ async function aiEnsureAutonomousSession() {
 
 // Extrait les blocs ```lang\nFILE: chemin\n...``` d'une réponse IA, sans
 // toucher au DOM (utilisé pour l'application automatique).
-// Détecte les fichiers dans une réponse IA. Robuste à 3 niveaux, dans
-// l'ordre : (1) marqueur FILE: explicite (avec ou sans //, #, <!-- -->
-// autour) ; (2) nom de fichier mentionné juste avant le bloc dans le texte
-// (ex: "Le fichier **index.html** contient...", ou "index.html:") ; (3) en
-// dernier recours, un nom par défaut déduit du langage du bloc — pour ne
-// JAMAIS silencieusement ignorer un fichier généré juste parce que le
-// modèle n'a pas suivi le format FILE: au caractère près.
-const AI_DEFAULT_PATH_BY_LANG = {
-  html: 'index.html', htm: 'index.html',
-  css: 'style.css',
-  js: 'script.js', javascript: 'script.js',
-  xml: 'res/xml/config.xml',
-  kotlin: 'app/src/main/java/MainActivity.kt', kt: 'app/src/main/java/MainActivity.kt',
-  java: 'app/src/main/java/MainActivity.java',
-  json: 'package.json',
-  python: 'script.py', py: 'script.py',
-};
 function aiExtractFileBlocks(content) {
-  const str = String(content);
-  const fenceRe = /```(\w*)\r?\n([\s\S]*?)```/g;
+  const parts = String(content).split(/```(\w*)\n([\s\S]*?)```/g);
   const files = [];
-  const usedPaths = new Set();
-  let m;
-  while ((m = fenceRe.exec(str))) {
-    const lang = (m[1] || '').toLowerCase();
-    let code = m[2] || '';
-    let path = null;
-
-    // Niveau 1 : marqueur FILE: strict ou légèrement habillé (//, #, <!-- -->)
-    const fileMatch = code.match(/^\s*(?:\/\/|#|<!--)?\s*FILE:\s*(\S.*?)(?:-->)?\s*\r?\n/i);
-    if (fileMatch) {
-      path = fileMatch[1].trim();
-      code = code.slice(fileMatch[0].length);
-    } else {
-      // Niveau 2 : nom de fichier mentionné juste avant le bloc dans le texte libre
-      const before = str.slice(Math.max(0, m.index - 220), m.index);
-      const nameMatch =
-        before.match(/\*\*([A-Za-z0-9_\-./]+\.(?:html?|css|js|xml|kt|java|json|py|dart|txt|yaml|yml))\*\*/i) ||
-        before.match(/`([A-Za-z0-9_\-./]+\.(?:html?|css|js|xml|kt|java|json|py|dart|txt|yaml|yml))`/i) ||
-        before.match(/([A-Za-z0-9_\-./]+\.(?:html?|css|js|xml|kt|java|json|py|dart|txt|yaml|yml))\s*:?\s*$/i);
-      if (nameMatch) path = nameMatch[1].trim();
-      // Niveau 3 : défaut selon le langage du bloc
-      else if (AI_DEFAULT_PATH_BY_LANG[lang]) path = AI_DEFAULT_PATH_BY_LANG[lang];
+  for (let i = 0; i < parts.length; i++) {
+    if (i % 3 === 1) {
+      let code = parts[i + 1] || '';
+      const fileMatch = code.match(/^\s*FILE:\s*(\S.*)\r?\n/);
+      if (fileMatch) files.push({ path: fileMatch[1].trim(), code: code.slice(fileMatch[0].length) });
+      i++;
     }
-
-    if (!path || !code.trim()) continue; // rien d'exploitable pour ce bloc, on l'ignore proprement
-
-    let finalPath = path;
-    let n = 2;
-    while (usedPaths.has(finalPath)) { finalPath = path.replace(/(\.[A-Za-z0-9]+)?$/, `_${n}$1`); n++; }
-    usedPaths.add(finalPath);
-    files.push({ path: finalPath, code });
   }
   return files;
 }
@@ -10377,18 +9661,11 @@ function aiExtractFileBlocks(content) {
 // Applique directement au projet tout ce que l'IA vient de renvoyer :
 // crée la session si besoin, écrit chaque fichier FILE:, coche les
 // permissions android.permission.XXX détectées. Appelé automatiquement
-// après chaque réponse quand le mode autonome est activé ET le pilote
-// automatique est coché (exécution immédiate, zéro confirmation).
+// après chaque réponse quand le mode autonome est activé.
 async function aiAutoApplyResponse(replyText) {
   const files = aiExtractFileBlocks(replyText);
   const perms = aiExtractPermissions(replyText);
   if (!files.length && !perms.length) return;
-  await aiApplyFilesAndPerms(files, perms, { autoBuild: true });
-}
-
-// Logique partagée d'écriture des fichiers + permissions, avec ou sans
-// build automatique enchaîné derrière.
-async function aiApplyFilesAndPerms(files, perms, { autoBuild }) {
   try {
     if (files.length) await aiEnsureAutonomousSession();
     let written = 0, failed = 0;
@@ -10402,65 +9679,11 @@ async function aiApplyFilesAndPerms(files, perms, { autoBuild }) {
     if (written) bits.push(`${written} fichier(s) écrit(s)`);
     if (failed) bits.push(`${failed} échec(s)`);
     if (perms.length) bits.push(`${perms.length} permission(s) appliquée(s)`);
-    if (bits.length) appendAISystemNote('🤖 ' + bits.join(', ') + '. Le projet est à jour.');
-    if (written && autoBuild) await aiAutoBuildAndReport();
-    return { written, failed };
+    if (bits.length) appendAISystemNote('🤖 Mode autonome : ' + bits.join(', ') + '. Le projet est à jour.');
+    if (written) await aiAutoBuildAndReport();
   } catch (e) {
-    appendAISystemNote('⚠ ' + e.message);
-    return { written: 0, failed: files.length };
+    appendAISystemNote('⚠ Mode autonome : ' + e.message);
   }
-}
-
-// ---------------------------------------------------------------------
-// Mode SEMI-AUTOMATIQUE (Mode autonome activé, Pilote automatique
-// désactivé) : au lieu d'exécuter tout de suite, on propose des boutons
-// de confirmation étape par étape sous le message — le client clique
-// au lieu de devoir taper "oui"/"non" dans le chat, et rien n'est
-// exécuté avant qu'il ait cliqué.
-// ---------------------------------------------------------------------
-function aiRenderStepConfirm(msgDiv, replyText) {
-  const files = aiExtractFileBlocks(replyText);
-  const perms = aiExtractPermissions(replyText);
-  if (!files.length && !perms.length) return;
-
-  const box = document.createElement('div');
-  box.className = 'ai-files-summary';
-  const fileList = files.map(f => `<li>📄 ${esc(f.path)}</li>`).join('');
-  box.innerHTML = `
-    <div class="ai-files-summary-head">❓ ${files.length} fichier(s) prêt(s) — tu veux que je crée le projet (si besoin) et que je les insère dans les bons dossiers ?</div>
-    <ul>${fileList}</ul>
-    <div class="ai-files-summary-actions">
-      <button onclick="aiStepConfirmInsert(this)">✅ Oui, crée le projet et insère</button>
-      <button class="secondary" onclick="this.closest('.ai-files-summary').remove()">✖ Non merci</button>
-    </div>`;
-  box.dataset.files = JSON.stringify(files);
-  box.dataset.perms = JSON.stringify(perms);
-  msgDiv.appendChild(box);
-}
-
-async function aiStepConfirmInsert(btn) {
-  const box = btn.closest('.ai-files-summary');
-  const files = JSON.parse(box.dataset.files || '[]');
-  const perms = JSON.parse(box.dataset.perms || '[]');
-  box.innerHTML = `<div class="ai-files-summary-head">⏳ Création du projet et insertion en cours…</div>`;
-  const { written } = await aiApplyFilesAndPerms(files, perms, { autoBuild: false });
-  if (!written) {
-    box.innerHTML = `<div class="ai-files-summary-head">❌ Échec de l'insertion — regarde le journal pour le détail.</div>`;
-    return;
-  }
-  box.innerHTML = `
-    <div class="ai-files-summary-head">✅ ${written} fichier(s) inséré(s) dans le projet. Tu veux que je lance le build maintenant ?</div>
-    <div class="ai-files-summary-actions">
-      <button onclick="aiStepConfirmBuild(this)">🛠 Oui, build l'APK</button>
-      <button class="secondary" onclick="this.closest('.ai-files-summary').remove()">✖ Pas tout de suite</button>
-    </div>`;
-}
-
-async function aiStepConfirmBuild(btn) {
-  const box = btn.closest('.ai-files-summary');
-  box.innerHTML = `<div class="ai-files-summary-head">⏳ Build en cours…</div>`;
-  await aiAutoBuildAndReport();
-  box.remove(); // le résultat du build (lien de téléchargement ou erreur) est déjà ajouté au chat par aiAutoBuildAndReport
 }
 
 // Lance automatiquement le build (comme un clic sur "Build APK") puis
@@ -10739,13 +9962,8 @@ async function aiSendMessage(resend) {
       aiSpeak(replyText);
     }
 
-    if (localStorage.getItem(AI_LS_AUTOPILOT) === '1') {
-      // Pilote automatique : exécution immédiate, sans confirmation.
-      if (localStorage.getItem(AI_LS_AUTONOMOUS) === '1') await aiAutoApplyResponse(replyText);
-    } else if (localStorage.getItem(AI_LS_AUTONOMOUS) === '1') {
-      // Mode autonome sans pilote automatique : on propose des boutons de
-      // confirmation étape par étape au lieu d'agir tout seul.
-      aiRenderStepConfirm(div, replyText);
+    if (localStorage.getItem(AI_LS_AUTONOMOUS) === '1') {
+      await aiAutoApplyResponse(replyText);
     }
 
     // Images générées (format OpenRouter : message.images[].image_url.url)

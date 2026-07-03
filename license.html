@@ -64,6 +64,14 @@
   .field input:focus { border-color: var(--accent); }
   .field-hint { font-size: 10.5px; color: var(--muted); margin-top: 5px; }
 
+  .key-input {
+    font-family: var(--mono);
+    letter-spacing: 3px;
+    text-align: center;
+    text-transform: uppercase;
+    font-size: 16px !important;
+  }
+
   .btn {
     width: 100%;
     padding: 11px;
@@ -120,15 +128,48 @@
   .link:hover { text-decoration: underline; }
 
   .footer-row { display: flex; justify-content: space-between; align-items: center; margin-top: 16px; }
-  .user-pill {
+  .center-row { text-align: center; margin-top: 16px; }
+
+  .key-pill {
     display: flex; align-items: center; justify-content: space-between;
     background: var(--panel2); border: 1px solid var(--border); border-radius: 8px;
-    padding: 8px 12px; margin-bottom: 18px; font-size: 12px; color: var(--text-dim);
+    padding: 12px 14px; margin-bottom: 16px;
   }
-  .user-pill .logout { color: var(--red); cursor: pointer; font-family: var(--mono); }
+  .key-pill .value { font-family: var(--mono); font-size: 15px; letter-spacing: 2px; color: var(--accent); }
+  .key-pill button {
+    background: transparent; border: 1px solid var(--border); color: var(--text-dim);
+    border-radius: 6px; padding: 5px 10px; font-size: 11px; cursor: pointer;
+  }
+  .key-pill button:hover { color: var(--text); border-color: var(--muted); }
 
   .step { display: none; }
   .step.active { display: block; }
+
+  .modal-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,.6);
+    align-items: center;
+    justify-content: center;
+    z-index: 999;
+    -webkit-app-region: no-drag;
+  }
+  .modal-overlay.active { display: flex; }
+  .modal-box {
+    width: 360px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 24px;
+    box-shadow: 0 20px 60px rgba(0,0,0,.6);
+    animation: modalIn .15s ease-out;
+  }
+  @keyframes modalIn { from { opacity: 0; transform: scale(.96); } to { opacity: 1; transform: scale(1); } }
+  .modal-box h2 { font-size: 15px; font-weight: 600; margin-bottom: 10px; }
+  .modal-box p { font-size: 12.5px; color: var(--text-dim); line-height: 1.55; margin-bottom: 20px; white-space: pre-line; }
+  .modal-actions { display: flex; gap: 10px; }
+  .modal-actions .btn { margin-top: 0; }
 </style>
 </head>
 <body>
@@ -142,62 +183,49 @@
     </div>
   </div>
 
-  <!-- Étape 1 : email -->
-  <div class="step active" id="step-email">
-    <h1>Connexion</h1>
-    <div class="sub">Entre ton email pour accéder à ton compte ou en créer un.</div>
-    <div class="msg" id="msg-email"></div>
-    <div class="field">
-      <label>Email</label>
-      <input type="email" id="input-email" placeholder="toi@exemple.com" autofocus>
+  <!-- Étape 0 : reconnexion silencieuse si une clé est déjà enregistrée -->
+  <div class="step active" id="step-autologin">
+    <div class="sub" id="msg-autologin" style="margin-bottom:0;">
+      <span class="spinner"></span>
+      Vérification de la licence…
     </div>
-    <button class="btn btn-primary" id="btn-check-email">Continuer</button>
   </div>
 
-  <!-- Étape 2a : connexion (compte existant) -->
-  <div class="step" id="step-login">
-    <h1>Bon retour</h1>
-    <div class="sub" id="login-sub">Entre ton mot de passe pour continuer.</div>
-    <div class="msg" id="msg-login"></div>
+  <!-- Étape 1 : saisie de la clé de licence -->
+  <div class="step" id="step-key">
+    <h1>Activer ta licence</h1>
+    <div class="sub">Entre la clé de licence à 10 caractères qui t'a été transmise après ton achat.</div>
+    <div class="msg" id="msg-key"></div>
     <div class="field">
-      <label>Mot de passe</label>
-      <input type="password" id="input-password-login" placeholder="••••••••">
+      <label>Clé de licence</label>
+      <input type="text" id="input-license-key" class="key-input" placeholder="XXXXX-XXXXX" maxlength="11" autofocus>
+      <div class="field-hint">Sensible à la casse ? Non — les majuscules/minuscules n'ont pas d'importance.</div>
     </div>
-    <button class="btn btn-primary" id="btn-login">Se connecter</button>
-    <button class="btn btn-ghost" id="btn-back-email-1">← Changer d'email</button>
+    <button class="btn btn-primary" id="btn-activate-key">Activer</button>
+    <div class="center-row">
+      <span class="link" id="link-go-plans">Pas encore de clé ? Acheter un abonnement</span>
+    </div>
   </div>
 
-  <!-- Étape 2b : création de compte (nouvel email) -->
-  <div class="step" id="step-signup">
-    <h1>Créer ton compte</h1>
-    <div class="sub">Choisis un mot de passe pour ton compte APK Factory Pro.</div>
-    <div class="msg" id="msg-signup"></div>
-    <div class="field">
-      <label>Mot de passe</label>
-      <input type="password" id="input-password-signup" placeholder="Minimum 6 caractères">
-      <div class="field-hint">Tu en auras besoin pour te reconnecter plus tard.</div>
-    </div>
-    <button class="btn btn-primary" id="btn-signup">Créer mon compte</button>
-    <button class="btn btn-ghost" id="btn-back-email-2">← Changer d'email</button>
-  </div>
-
-  <!-- Étape 3 : choix du plan + paiement -->
+  <!-- Étape 2 : choix du plan + paiement -->
   <div class="step" id="step-plans">
-    <div class="user-pill">
-      <span id="user-pill-email"></span>
-      <span class="logout" id="btn-logout">Déconnexion</span>
-    </div>
     <h1>Choisis ton abonnement</h1>
-    <div class="sub" id="plans-sub">Sélectionne une formule pour activer ta licence.</div>
+    <div class="sub" id="plans-sub">Sélectionne une formule. Une clé de licence sera générée automatiquement après paiement.</div>
     <div class="msg" id="msg-plans"></div>
     <div class="plans" id="plans-list"></div>
     <button class="btn btn-primary" id="btn-pay" disabled>Payer avec FedaPay</button>
+    <button class="btn btn-ghost" id="btn-back-key">← J'ai déjà une clé</button>
   </div>
 
-  <!-- Étape 4 : en attente de paiement -->
+  <!-- Étape 3 : en attente de paiement -->
   <div class="step" id="step-waiting">
     <h1>Paiement en cours</h1>
     <div class="sub">Termine le paiement dans la fenêtre ouverte. Cette page se mettra à jour automatiquement dès confirmation.</div>
+    <div class="key-pill">
+      <span class="value" id="waiting-key-value">—</span>
+      <button id="btn-copy-waiting-key">Copier</button>
+    </div>
+    <div class="field-hint" style="margin-bottom:14px;">Note cette clé quelque part : elle te permettra de réactiver ta licence même si tu fermes l'app avant la fin du paiement.</div>
     <div class="msg info" id="msg-waiting" style="display:block;">
       <span class="spinner" style="border-top-color:#7dd8ff;border-color:#5ac8fa44;"></span>
       En attente de confirmation FedaPay…
@@ -209,6 +237,20 @@
   <div class="footer-row">
     <span class="link" id="link-support">Besoin d'aide ?</span>
     <span style="font-size:11px;color:var(--muted);font-family:var(--mono);">v3.0.0</span>
+  </div>
+</div>
+
+<!-- Modal "licence déjà utilisée sur un autre appareil" (remplace window.confirm,
+     qui peut ne pas s'afficher correctement dans une fenêtre Electron sans
+     cadre / -webkit-app-region: drag). -->
+<div class="modal-overlay" id="modal-device">
+  <div class="modal-box">
+    <h2>Licence déjà utilisée ailleurs</h2>
+    <p id="modal-device-text"></p>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" id="modal-device-no">Non, annuler</button>
+      <button class="btn btn-primary" id="modal-device-yes">Oui, continuer ici</button>
+    </div>
   </div>
 </div>
 
