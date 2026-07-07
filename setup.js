@@ -23,6 +23,17 @@ const path  = require('path');
 const { execFile } = require('child_process');
 const { pipeline } = require('stream/promises');
 
+// Avec shell:true sur Windows, Node se contente de coller [file, ...args]
+// avec des espaces avant de les passer à cmd.exe — sans jamais ajouter de
+// guillemets automatiquement. Un chemin contenant un espace (ex: dossier
+// utilisateur "John Doe", ou "APK Factory Pro" dans %APPDATA%) casserait
+// donc la ligne de commande. On quote ici nous-mêmes chaque élément qui en
+// a besoin avant de le donner à execFile.
+function winShellQuote(arg) {
+  const s = String(arg);
+  return /[\s"]/.test(s) ? `"${s.replace(/"/g, '\\"')}"` : s;
+}
+
 // ---------------------------------------------------------------------
 // Dossier racine où tout est installé — même logique que server.py dans
 // main.js : resourcesPath/tools une fois packagé (à côté de l'exe),
@@ -32,9 +43,58 @@ function resolveRoot() {
   if (process.env.APKF_TOOLS_DIR) return process.env.APKF_TOOLS_DIR;
   try {
     const { app } = require('electron');
-    if (app && app.isPackaged) return path.join(process.resourcesPath, 'tools');
+    if (app && app.isPackaged) {
+      // IMPORTANT : on n'utilise PAS resourcesPath/tools ici.
+      // resourcesPath se trouve dans le dossier d'installation du
+      // programme (ex: AppData\Local\Programs\... ou Program Files),
+      // qui est en lecture seule pour un compte non-admin. Tout
+      // téléchargement de composant (npm install, unzip...) qui tente
+      // d'y écrire échoue silencieusement (ex: react-native.cmd jamais
+      // créé). On redirige donc les composants TÉLÉCHARGEABLES vers un
+      // dossier utilisateur toujours inscriptible, qui en plus SURVIT à
+      // une désinstallation du programme (voulu : le client ne re-télécharge
+      // pas 500 Mo de composants à chaque réinstallation/mise à jour).
+      const userDataDir = app.getPath('userData'); // ex: %APPDATA%\apk-factory-pro
+      const writableRoot = path.join(userDataDir, 'tools');
+      seedFromBundledResourcesOnce(writableRoot);
+      return writableRoot;
+    }
   } catch { /* setup.js peut aussi tourner hors Electron (node setup.js en CLI) */ }
   return path.join(__dirname, 'tools');
+}
+
+// Copie UNE SEULE FOIS (si absent) les outils déjà embarqués dans
+// l'installeur (apktool.jar, apktool.bat, debug.keystore, android-sdk
+// build-tools — voir extraResources dans package.json) depuis le dossier
+// programme en lecture seule vers le dossier utilisateur inscriptible.
+// Sans ça, ces outils "de base" ne seraient plus trouvés du tout après
+// avoir déplacé ROOT.
+function seedFromBundledResourcesOnce(writableRoot) {
+  try {
+    const marker = path.join(writableRoot, 'apktool.jar');
+    if (fs.existsSync(marker)) return; // déjà migré, rien à refaire
+
+    const bundledDir = path.join(process.resourcesPath, 'tools');
+    if (!fs.existsSync(bundledDir)) return; // rien à copier (dev, ou build sans tools embarqués)
+
+    fs.mkdirSync(writableRoot, { recursive: true });
+    copyRecursiveSync(bundledDir, writableRoot);
+    log(`Outils de base copiés depuis ${bundledDir} vers ${writableRoot}`);
+  } catch (e) {
+    log(`[AVERT] Echec de la copie initiale des outils embarqués : ${e.message}`);
+  }
+}
+
+function copyRecursiveSync(src, dest) {
+  const stat = fs.statSync(src);
+  if (stat.isDirectory()) {
+    fs.mkdirSync(dest, { recursive: true });
+    for (const entry of fs.readdirSync(src)) {
+      copyRecursiveSync(path.join(src, entry), path.join(dest, entry));
+    }
+  } else {
+    fs.copyFileSync(src, dest);
+  }
 }
 const ROOT = resolveRoot();
 const STATE_FILE = path.join(ROOT, 'installed-components.json');
@@ -84,7 +144,7 @@ const COMPONENTS = {
     sizeApprox: '20 Mo',
     urls: [
       'https://github.com/iBotPeaches/Apktool/releases/latest/download/apktool.jar',
-      'https://bitbucket.org/iBotPeaches/apktool/downloads/apktool.jar'
+      'https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar'
     ]
   },
 
@@ -96,7 +156,8 @@ const COMPONENTS = {
     destFileName: 'bundletool.jar',
     sizeApprox: '25 Mo',
     urls: [
-      'https://github.com/google/bundletool/releases/latest/download/bundletool-all.jar'
+      'https://github.com/google/bundletool/releases/download/1.18.3/bundletool-all-1.18.3.jar',
+      'https://github.com/google/bundletool/releases/download/1.18.0/bundletool-all-1.18.0.jar'
     ]
   },
 
@@ -137,8 +198,11 @@ const COMPONENTS = {
       }
 
       const run = (args, input) => new Promise((resolve, reject) => {
-        const child = execFile(sdkmgr, args, {
-          cwd: destDir, env, windowsHide: true, maxBuffer: 1024 * 1024 * 32, timeout: 10 * 60 * 1000
+        // shell:true est indispensable ici : Node refuse d'exécuter un .bat
+        // directement depuis Node 17+ (mesure de sécurité), ce qui provoque
+        // sinon une erreur "spawn EINVAL" sur Windows.
+        const child = execFile(winShellQuote(sdkmgr), args.map(winShellQuote), {
+          cwd: destDir, env, windowsHide: true, shell: true, maxBuffer: 1024 * 1024 * 32, timeout: 10 * 60 * 1000
         }, (err, stdout, stderr) => {
           if (err) return reject(new Error(stderr || err.message));
           resolve(stdout);
@@ -247,7 +311,12 @@ const COMPONENTS = {
     type: 'npm-global',
     npmPackage: '@react-native-community/cli',
     dependsOn: ['nodejs', 'jdk', 'androidSdk', 'gradle'],
-    checkFile: path.join(ROOT, 'nodejs', 'react-native.cmd'),
+    // BUG CORRIGÉ : @react-native-community/cli installe un binaire nommé
+    // "rnc-cli" (pas "react-native" — c'était l'ancien paquet déprécié
+    // "react-native-cli" qui s'appelait ainsi). npm install réussissait donc
+    // réellement, mais checkFile pointait vers un fichier qui n'existe plus
+    // dans ce paquet, ce qui faisait échouer l'installation à tort après coup.
+    checkFile: path.join(ROOT, 'nodejs', 'rnc-cli.cmd'),
     sizeApprox: '~15 Mo (+ Node.js si pas déjà installé)'
   },
 
@@ -261,6 +330,87 @@ const COMPONENTS = {
     dependsOn: ['nodejs', 'jdk', 'androidSdk'],
     checkFile: path.join(ROOT, 'nodejs', 'bubblewrap.cmd'),
     sizeApprox: '~10 Mo (+ Node.js/JDK/SDK si pas déjà installés)'
+  },
+
+  // ── Wrappers WebView additionnels (bêta) ────────────────────────────
+  // Même famille que cordova/reactNativeCli : CLI installés globalement
+  // via npm, réutilisent le Node.js portable déjà téléchargé. Marqués
+  // « bêta » car non testés avec les vrais binaires (ns/titanium) dans
+  // l'environnement de dev — voir agent-engine.js pour le détail des
+  // pipelines create/build correspondants.
+
+  nativescript: {
+    label: 'NativeScript CLI (WebView natif — bêta)',
+    type: 'npm-global',
+    npmPackage: 'nativescript',
+    // `ns build android` compile un vrai projet Gradle en interne, comme
+    // cordova/reactNativeCli — mêmes prérequis réels.
+    dependsOn: ['nodejs', 'jdk', 'androidSdk', 'gradle'],
+    checkFile: path.join(ROOT, 'nodejs', 'ns.cmd'),
+    sizeApprox: '~30 Mo (+ Node.js/JDK/SDK/Gradle si pas déjà installés)'
+  },
+
+  titanium: {
+    label: 'Titanium CLI (Appcelerator — WebView natif — bêta)',
+    type: 'npm-global',
+    npmPackage: 'titanium',
+    // `titanium build -p android` a besoin d'un JDK + Android SDK déjà en
+    // place (pas de Gradle : Titanium utilise son propre système de build).
+    dependsOn: ['nodejs', 'jdk', 'androidSdk'],
+    checkFile: path.join(ROOT, 'nodejs', 'titanium.cmd'),
+    sizeApprox: '~15 Mo (+ Node.js/JDK/SDK si pas déjà installés)'
+  },
+
+  dotnetMaui: {
+    label: '.NET SDK 8 + workload MAUI Android (WebView natif — bêta)',
+    // Contrairement à cordova/nativescript/titanium (npm), .NET MAUI a
+    // besoin du SDK .NET lui-même (pas Node.js) + d'un workload additionnel
+    // installé après coup — pas disponible via un simple npm install.
+    dependsOn: ['jdk', 'androidSdk'],
+    destDir: path.join(ROOT, 'dotnet'),
+    checkFile: path.join(ROOT, 'dotnet', 'dotnet.exe'),
+    type: 'zip',
+    sizeApprox: '~200 Mo (+ ~300 Mo pour le workload maui-android via postInstall)',
+    urls: [
+      'https://dotnetcli.azureedge.net/dotnet/Sdk/8.0.404/dotnet-sdk-8.0.404-win-x64.zip',
+      'https://builds.dotnet.microsoft.com/dotnet/Sdk/8.0.404/dotnet-sdk-8.0.404-win-x64.zip'
+    ],
+    // Étape post-extraction : le SDK de base ne suffit pas à `dotnet new
+    // maui` / `dotnet build -f net8.0-android` — il faut en plus le workload
+    // maui-android, pas installé par défaut. Même logique que androidSdk
+    // (sdkmanager) : checkFile (dotnet.exe) existe déjà après extraction,
+    // mais on vérifie ICI en plus que le workload est bien présent, sans
+    // quoi le premier `dotnet build` échouerait avec une erreur peu claire
+    // ("workload not installed") beaucoup plus tard, au moment du build.
+    async postInstall(destDir, onProgress, id) {
+      const dotnetExe = path.join(destDir, 'dotnet.exe');
+      const env = Object.assign({}, process.env, {
+        DOTNET_ROOT: destDir,
+        PATH: destDir + path.delimiter + (process.env.PATH || ''),
+        DOTNET_CLI_TELEMETRY_OPTOUT: '1',
+        DOTNET_NOLOGO: '1',
+      });
+      const run = (args) => new Promise((resolve, reject) => {
+        // shell:true pour la même raison que sdkmanager.bat plus haut —
+        // cohérence Windows/espaces dans les chemins.
+        execFile(winShellQuote(dotnetExe), args.map(winShellQuote),
+          { cwd: destDir, env, windowsHide: true, shell: true, maxBuffer: 1024 * 1024 * 32, timeout: 15 * 60 * 1000 },
+          (err, stdout, stderr) => {
+            if (err) return reject(new Error(stderr || err.message));
+            resolve(stdout);
+          });
+      });
+
+      if (onProgress) onProgress({ id, status: 'downloading', pct: undefined, message: '⏳ Installation du workload maui-android (peut prendre plusieurs minutes)...' });
+      log('📦 Installation du workload .NET MAUI (Android)...');
+      await run(['workload', 'install', 'maui-android', '--skip-manifest-update']);
+
+      const listOut = await run(['workload', 'list']);
+      if (!/maui-android/i.test(listOut)) {
+        throw new Error('Le workload maui-android ne semble pas installé après `dotnet workload install` (voir logs ci-dessus).');
+      }
+      log('✅ Workload maui-android installé et vérifié.');
+    }
   }
 };
 
@@ -510,8 +660,8 @@ async function installAiItem(registry, id, onProgress) {
   }
 
   if (onProgress) onProgress({ id, status: 'downloading', pct: 0 });
-  await downloadWithFallback(urlsToTry, tmpFile, (pct, received, total) => {
-    if (onProgress) onProgress({ id, status: 'downloading', pct: pct ?? undefined, received, total });
+  await downloadWithFallback(urlsToTry, tmpFile, (pct, received, total, message) => {
+    if (onProgress) onProgress({ id, status: 'downloading', pct: pct ?? undefined, received, total, message });
   });
 
   if (item.type === 'file') {
@@ -612,27 +762,38 @@ function downloadOne(url, destPath, onProgress, redirectCount = 0) {
 async function downloadWithFallback(urls, destPath, onProgress) {
   let lastErr = null;
 
+  // notifyMsg() : remonte un message texte "temps réel" à l'UI (via le même
+  // canal onProgress que la progression numérique), en plus du log console.
+  // Sans ça, l'utilisateur ne voit rien bouger tant que TOUS les miroirs
+  // n'ont pas échoué — il ne sait jamais quel miroir est essayé ni pourquoi
+  // il a échoué avant l'erreur finale.
+  const notifyMsg = (msg) => {
+    log(msg);
+    if (onProgress) onProgress(undefined, undefined, undefined, msg);
+  };
+
   // ── Tentatives via Node.js (avec suivi de progression) ──────────────
   for (let i = 0; i < urls.length; i++) {
     const url = urls[i];
     try {
-      log(`Téléchargement (miroir ${i + 1}/${urls.length}) : ${url}`);
+      notifyMsg(`Miroir ${i + 1}/${urls.length} : ${url}`);
       await downloadOne(url, destPath, onProgress);
       const stat = fs.statSync(destPath);
       if (stat.size < 1024) throw new Error('Fichier téléchargé anormalement petit (lien probablement mort)');
-      log(`OK — ${(stat.size / 1024 / 1024).toFixed(1)} Mo`);
+      notifyMsg(`OK — ${(stat.size / 1024 / 1024).toFixed(1)} Mo`);
       return url;
     } catch (err) {
-      log(`Échec sur ce miroir : ${err.message} — tentative suivante...`);
+      notifyMsg(`❌ Échec miroir ${i + 1}/${urls.length} : ${err.message}`);
       lastErr = err;
       try { fs.unlinkSync(destPath); } catch {}
     }
   }
 
   // ── Fallback système : curl ──────────────────────────────────────────
-  for (const url of urls) {
+  for (let i = 0; i < urls.length; i++) {
+    const url = urls[i];
     try {
-      log(`Tentative curl : ${url}`);
+      notifyMsg(`Tentative curl (${i + 1}/${urls.length})...`);
       await new Promise((resolve, reject) => {
         const { execFile } = require('child_process');
         execFile('curl', ['-L', '--fail', '--ssl-no-revoke', '--max-redirs', '10',
@@ -647,18 +808,20 @@ async function downloadWithFallback(urls, destPath, onProgress) {
           });
       });
       const stat = fs.statSync(destPath);
-      log(`OK via curl — ${(stat.size / 1024 / 1024).toFixed(1)} Mo`);
+      notifyMsg(`OK via curl — ${(stat.size / 1024 / 1024).toFixed(1)} Mo`);
       return url;
     } catch (err) {
-      log(`curl échoué : ${err.message}`);
+      notifyMsg(`❌ curl échoué (${i + 1}/${urls.length}) : ${err.message}`);
+      lastErr = err;
       try { fs.unlinkSync(destPath); } catch {}
     }
   }
 
   // ── Fallback système : PowerShell ────────────────────────────────────
-  for (const url of urls) {
+  for (let i = 0; i < urls.length; i++) {
+    const url = urls[i];
     try {
-      log(`Tentative PowerShell : ${url}`);
+      notifyMsg(`Tentative PowerShell (${i + 1}/${urls.length})...`);
       await new Promise((resolve, reject) => {
         const { execFile } = require('child_process');
         const cmd = `[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12;` +
@@ -674,15 +837,16 @@ async function downloadWithFallback(urls, destPath, onProgress) {
           });
       });
       const stat = fs.statSync(destPath);
-      log(`OK via PowerShell — ${(stat.size / 1024 / 1024).toFixed(1)} Mo`);
+      notifyMsg(`OK via PowerShell — ${(stat.size / 1024 / 1024).toFixed(1)} Mo`);
       return url;
     } catch (err) {
-      log(`PowerShell échoué : ${err.message}`);
+      notifyMsg(`❌ PowerShell échoué (${i + 1}/${urls.length}) : ${err.message}`);
+      lastErr = err;
       try { fs.unlinkSync(destPath); } catch {}
     }
   }
 
-  throw new Error(`Tous les téléchargements ont échoué. Dernière erreur Node.js : ${lastErr?.message}`);
+  throw new Error(`Tous les téléchargements ont échoué (${urls.length} miroir(s) × 3 méthodes). Dernière erreur : ${lastErr?.message}`);
 }
 
 // ---------------------------------------------------------------------
@@ -735,18 +899,43 @@ function flattenSingleRootFolder(destDir) {
 // Contrairement aux composants zip/file, il n'y a pas d'URL de miroir :
 // npm gère lui-même le téléchargement depuis le registre npm officiel.
 // ---------------------------------------------------------------------
-function runNpmGlobalInstall(pkgName, onLine) {
+// Registres npm essayés dans l'ordre — si le registre officiel est
+// inaccessible (réseau/pare-feu/région), on retente automatiquement sur un
+// miroir avant d'abandonner, exactement comme pour les téléchargements zip.
+const NPM_REGISTRIES = [
+  'https://registry.npmjs.org/',
+  'https://registry.npmmirror.com/',
+];
+
+function runNpmGlobalInstallOnce(pkgName, registry, onLine) {
   return new Promise((resolve, reject) => {
     const nodeDir = COMPONENTS.nodejs.destDir;
     const npmCmd = path.join(nodeDir, 'npm.cmd');
     if (!fs.existsSync(npmCmd)) {
       return reject(new Error('npm.cmd introuvable — Node.js doit être installé avant ce composant.'));
     }
+    // BUG CORRIGÉ : sans forcer explicitement le préfixe global, npm peut
+    // écrire les shims (.cmd) ailleurs que nodeDir (ex: %APPDATA%\npm) si
+    // un .npmrc préexistant sur la machine cliente définit déjà un autre
+    // "prefix". npm install -g réussissait alors (exit code 0) mais
+    // checkFile (nodeDir/react-native.cmd) restait introuvable.
+    //
+    // BUG CORRIGÉ (2) : userconfig et globalconfig pointaient vers EXACTEMENT
+    // le même fichier. npm charge ces deux réglages comme deux configs
+    // distinctes ("user" puis "global") et refuse ensuite de charger un
+    // fichier déjà chargé sous un autre "type" — erreur immédiate
+    // "double-loading config ... as global, previously loaded as user",
+    // avant même que l'installation ne démarre. Chaque config vide doit
+    // donc être un fichier séparé.
     const env = Object.assign({}, process.env, {
-      PATH: nodeDir + path.delimiter + (process.env.PATH || '')
+      PATH: nodeDir + path.delimiter + (process.env.PATH || ''),
+      npm_config_prefix: nodeDir,
+      npm_config_userconfig: path.join(nodeDir, '.npmrc-apkfactory-empty-user'),
+      npm_config_globalconfig: path.join(nodeDir, '.npmrc-apkfactory-empty-global'),
     });
-    const child = execFile(npmCmd, ['install', '-g', pkgName, '--no-fund', '--no-audit'],
-      { cwd: nodeDir, env, windowsHide: true, maxBuffer: 1024 * 1024 * 32, timeout: 10 * 60 * 1000 },
+    const args = ['install', '-g', pkgName, '--prefix', nodeDir, '--no-fund', '--no-audit', '--registry', registry];
+    const child = execFile(winShellQuote(npmCmd), args.map(winShellQuote),
+      { cwd: nodeDir, env, windowsHide: true, shell: true, maxBuffer: 1024 * 1024 * 32, timeout: 10 * 60 * 1000 },
       (err, stdout, stderr) => {
         if (onLine && stdout) stdout.split('\n').forEach(l => l.trim() && onLine(l));
         if (onLine && stderr) stderr.split('\n').forEach(l => l.trim() && onLine(l));
@@ -756,16 +945,34 @@ function runNpmGlobalInstall(pkgName, onLine) {
   });
 }
 
+async function runNpmGlobalInstall(pkgName, onLine) {
+  let lastErr = null;
+  for (let i = 0; i < NPM_REGISTRIES.length; i++) {
+    const registry = NPM_REGISTRIES[i];
+    try {
+      if (onLine) onLine(`Registre npm ${i + 1}/${NPM_REGISTRIES.length} : ${registry}`);
+      await runNpmGlobalInstallOnce(pkgName, registry, onLine);
+      if (onLine) onLine(`OK via ${registry}`);
+      return;
+    } catch (err) {
+      if (onLine) onLine(`❌ Échec registre ${registry} : ${err.message}`);
+      lastErr = err;
+    }
+  }
+  throw new Error(`Installation npm de ${pkgName} échouée sur tous les registres (${NPM_REGISTRIES.length}). Dernière erreur : ${lastErr?.message}`);
+}
+
 // ---------------------------------------------------------------------
 // Installation d'un composant unique — résout d'abord ses dépendances
 // (ex: cordova/reactNativeCli dépendent de nodejs) puis installe le
 // composant lui-même, quel que soit son type (zip / file / npm-global).
 // ---------------------------------------------------------------------
-async function installComponent(id, onProgress) {
+async function installComponent(id, onProgress, opts) {
+  const force = !!(opts && opts.force);
   const comp = COMPONENTS[id];
   if (!comp) throw new Error(`Composant inconnu : ${id}`);
 
-  if (isInstalled(id)) {
+  if (isInstalled(id) && !force) {
     log(`${comp.label} déjà installé, on passe.`);
     if (onProgress) onProgress({ id, status: 'already-installed', pct: 100 });
     return;
@@ -776,16 +983,22 @@ async function installComponent(id, onProgress) {
   if (comp.dependsOn) {
     for (const depId of comp.dependsOn) {
       if (!isInstalled(depId)) {
-        log(`${comp.label} nécessite ${COMPONENTS[depId]?.label || depId} — installation préalable...`);
+        const depLabel = COMPONENTS[depId]?.label || depId;
+        log(`${comp.label} nécessite ${depLabel} — installation préalable...`);
+        if (onProgress) onProgress({ id, status: 'downloading', message: `⏳ Dépendance requise : ${depLabel} — installation en cours...` });
         await installComponent(depId, onProgress);
+        if (onProgress) onProgress({ id, status: 'downloading', message: `✅ ${depLabel} prêt — poursuite de ${comp.label}...` });
       }
     }
   }
 
   if (comp.type === 'npm-global') {
-    if (onProgress) onProgress({ id, status: 'downloading', pct: undefined });
+    if (onProgress) onProgress({ id, status: 'downloading', pct: undefined, message: `Installation npm : ${comp.npmPackage}...` });
     log(`📦 Installation npm global : ${comp.npmPackage}...`);
-    await runNpmGlobalInstall(comp.npmPackage, (line) => log(`  ${line}`));
+    await runNpmGlobalInstall(comp.npmPackage, (line) => {
+      log(`  ${line}`);
+      if (onProgress) onProgress({ id, status: 'downloading', pct: undefined, message: line });
+    });
     if (!fs.existsSync(comp.checkFile)) {
       throw new Error(`Installation de ${comp.label} incomplète : ${comp.checkFile} introuvable après npm install.`);
     }
@@ -802,8 +1015,8 @@ async function installComponent(id, onProgress) {
 
   if (onProgress) onProgress({ id, status: 'downloading', pct: 0 });
 
-  const usedUrl = await downloadWithFallback(comp.urls, tmpFile, (pct, received, total) => {
-    if (onProgress) onProgress({ id, status: 'downloading', pct: pct ?? undefined, received, total });
+  const usedUrl = await downloadWithFallback(comp.urls, tmpFile, (pct, received, total, message) => {
+    if (onProgress) onProgress({ id, status: 'downloading', pct: pct ?? undefined, received, total, message });
   });
 
   if (comp.type === 'file') {
@@ -839,11 +1052,11 @@ async function installComponent(id, onProgress) {
 // ---------------------------------------------------------------------
 // Installation d'une liste de composants (ceux cochés par l'utilisateur)
 // ---------------------------------------------------------------------
-async function installComponents(ids, onProgress) {
+async function installComponents(ids, onProgress, opts) {
   const results = {};
   for (const id of ids) {
     try {
-      await installComponent(id, onProgress);
+      await installComponent(id, onProgress, opts);
       results[id] = { ok: true };
     } catch (err) {
       log(`❌ Échec installation ${id} : ${err.message}`);
@@ -851,6 +1064,74 @@ async function installComponents(ids, onProgress) {
       if (onProgress) onProgress({ id, status: 'error', error: err.message });
     }
   }
+  return results;
+}
+
+// Réinstalle un composant déjà présent par-dessus l'existant (utilisé par
+// "Vérifier les mises à jour" quand une version plus récente a été trouvée
+// sur GitHub). On vide d'abord son dossier pour éviter qu'un vieux fichier
+// de l'ancienne version ne traîne à côté du nouveau.
+async function updateComponent(id, onProgress) {
+  const comp = COMPONENTS[id];
+  if (!comp) throw new Error(`Composant inconnu : ${id}`);
+  if (comp.destDir && fs.existsSync(comp.destDir) && comp.type !== 'npm-global') {
+    fs.rmSync(comp.destDir, { recursive: true, force: true });
+  }
+  await installComponent(id, onProgress, { force: true });
+}
+
+// =======================================================================
+// VÉRIFICATION DES MISES À JOUR DE COMPOSANTS (pas du logiciel lui-même) —
+// compare, pour chaque composant dont l'URL pointe vers une release GitHub
+// versionnée en dur (gradle, jadx...), la version actuellement codée dans
+// COMPONENTS avec la dernière release publiée sur GitHub. Les composants
+// dont l'URL utilise déjà "latest/download" (jdk, apktool, bundletool)
+// sont toujours à jour à l'installation et ne sont pas listés ici.
+// =======================================================================
+const COMPONENT_UPDATE_SOURCES = {
+  gradle: { repo: 'gradle/gradle', versionRegex: /gradle-([\d.]+)-bin\.zip/ },
+  jadx:   { repo: 'skylot/jadx',   versionRegex: /v([\d.]+)\/jadx-[\d.]+\.zip/ },
+};
+
+function _compareVersions(a, b) {
+  const pa = String(a).replace(/^v/i, '').split('.').map(n => parseInt(n, 10) || 0);
+  const pb = String(b).replace(/^v/i, '').split('.').map(n => parseInt(n, 10) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] || 0) - (pb[i] || 0);
+    if (d !== 0) return d < 0 ? -1 : 1;
+  }
+  return 0;
+}
+
+async function checkComponentUpdates() {
+  const results = [];
+  for (const [id, src] of Object.entries(COMPONENT_UPDATE_SOURCES)) {
+    const comp = COMPONENTS[id];
+    if (!comp || !isInstalled(id)) continue; // pas installé → rien à mettre à jour
+    const currentUrl = comp.urls.find(u => src.versionRegex.test(u)) || comp.urls[0];
+    const currentMatch = currentUrl.match(src.versionRegex);
+    const currentVersion = currentMatch ? currentMatch[1] : null;
+    try {
+      const release = await _httpsGetJson(`https://api.github.com/repos/${src.repo}/releases/latest`);
+      const latestVersion = String(release.tag_name || '').replace(/^v/i, '');
+      const updateAvailable = currentVersion ? _compareVersions(currentVersion, latestVersion) < 0 : false;
+      results.push({
+        id, label: comp.label,
+        currentVersion: currentVersion || '?',
+        latestVersion: latestVersion || '?',
+        updateAvailable,
+        releaseUrl: release.html_url || `https://github.com/${src.repo}/releases`,
+      });
+    } catch (err) {
+      results.push({ id, label: comp.label, currentVersion: currentVersion || '?', latestVersion: null, updateAvailable: false, error: err.message });
+    }
+  }
+  // Persisté pour que builder.html puisse afficher le dernier état connu
+  // dès l'ouverture, sans attendre un nouveau check réseau (utile hors
+  // ligne ou au tout premier rendu avant que le check async ne revienne).
+  const state = readState();
+  state.lastUpdateCheck = { checkedAt: new Date().toISOString(), results };
+  writeState(state);
   return results;
 }
 
@@ -863,12 +1144,208 @@ function listComponents() {
   }));
 }
 
+// =======================================================================
+// COMPOSANTS TROUVÉS PAR L'IA (hors registre COMPONENTS ci-dessus)
+// -----------------------------------------------------------------------
+// Le client a demandé : si un outil requis n'est pas dans la liste connue,
+// que l'IA le cherche sur GitHub et l'affiche comme téléchargeable. Ces
+// deux fonctions ne font QUE ça — chercher, puis installer SEULEMENT sur
+// action explicite du client dans l'UI (jamais depuis install_components,
+// qui reste volontairement limité au registre COMPONENTS ci-dessus).
+// =======================================================================
+const DYNAMIC_ROOT = path.join(ROOT, 'ai-components');
+
+// Domaines dont on accepte les liens de téléchargement. Historiquement
+// limité aux domaines GitHub, mais le prompt IA (aiSuggestComponents() dans
+// builder.html) demande une source "de préférence" GitHub — pas
+// exclusivement — donc l'IA peut légitimement renvoyer un lien SourceForge,
+// GitLab, ou le site officiel d'un outil connu. Avec la whitelist GitHub-only,
+// TOUTE suggestion non-GitHub échouait systématiquement à l'installation
+// ("Source refusée"), ce qui donnait l'impression que "rien ne se passe"
+// côté client. On élargit donc aux hébergeurs de confiance les plus
+// courants pour ce type d'outils, tout en gardant un principe de liste
+// blanche stricte (jamais un domaine arbitraire).
+const ALLOWED_DYNAMIC_HOSTS = [
+  'github.com',
+  'objects.githubusercontent.com',
+  'raw.githubusercontent.com',
+  'codeload.github.com',
+  'gitlab.com',
+  'sourceforge.net',
+  'downloads.sourceforge.net',
+  'bitbucket.org',
+  'apache.org',
+  'downloads.apache.org',
+  'maven.apache.org',
+];
+
+function _isAllowedDynamicUrl(url) {
+  try {
+    const u = new URL(url);
+    return u.protocol === 'https:' && ALLOWED_DYNAMIC_HOSTS.some(h => u.hostname === h || u.hostname.endsWith('.' + h));
+  } catch { return false; }
+}
+
+// Interroge l'API publique GitHub (aucune authentification, lecture seule)
+// pour trouver le dépôt le plus pertinent pour `query`, puis regarde sa
+// dernière release pour proposer un asset téléchargeable. Ne télécharge
+// rien : renvoie juste un candidat que l'humain devra valider dans l'UI.
+function _httpsGetJson(url) {
+  return new Promise((resolve, reject) => {
+    const req = https.get(url, {
+      headers: { 'User-Agent': 'APKFactoryPro-Setup', 'Accept': 'application/vnd.github+json' }
+    }, (res) => {
+      if (res.statusCode !== 200) { res.resume(); return reject(new Error(`HTTP ${res.statusCode} sur ${url}`)); }
+      let data = '';
+      res.on('data', (c) => data += c);
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)); } catch (e) { reject(e); }
+      });
+    });
+    req.on('error', reject);
+    req.setTimeout(15000, () => req.destroy(new Error('Timeout GitHub API')));
+  });
+}
+
+async function searchGithubReleaseAsset(query) {
+  const q = String(query || '').trim();
+  if (!q) return { ok: false, error: 'Recherche vide.' };
+  log(`🔎 Recherche GitHub pour « ${q} »...`);
+  try {
+    const search = await _httpsGetJson(
+      'https://api.github.com/search/repositories?sort=stars&order=desc&per_page=5&q=' + encodeURIComponent(q)
+    );
+    const repos = (search.items || []);
+    if (!repos.length) return { ok: false, error: `Aucun dépôt GitHub trouvé pour « ${q} ».` };
+
+    for (const repo of repos) {
+      let release;
+      try {
+        release = await _httpsGetJson(`https://api.github.com/repos/${repo.full_name}/releases/latest`);
+      } catch { continue; } // pas de release publiée sur ce dépôt, on essaie le suivant
+
+      const assets = release.assets || [];
+      // Priorité : archive/exécutable Windows explicite, sinon n'importe
+      // quel .zip/.jar/.exe (beaucoup d'outils CLI publient un seul asset
+      // multi-plateforme), jamais le tarball source auto-généré seul.
+      const pick = assets.find(a => /win|windows/i.test(a.name) && /\.(zip|exe)$/i.test(a.name))
+        || assets.find(a => /\.(zip|jar|exe)$/i.test(a.name));
+      if (!pick) continue;
+      if (!_isAllowedDynamicUrl(pick.browser_download_url)) continue;
+
+      const suggestion = {
+        ok: true,
+        id: 'ai_' + repo.name.toLowerCase().replace(/[^a-z0-9]+/g, '_'),
+        label: `${repo.name} (${pick.name})`,
+        url: pick.browser_download_url,
+        repoUrl: repo.html_url,
+        sizeApprox: pick.size ? `${(pick.size / 1024 / 1024).toFixed(1)} Mo` : '',
+        type: /\.zip$/i.test(pick.name) ? 'zip' : 'file',
+        assetName: pick.name,
+      };
+      saveAiSuggestion(suggestion); // persisté : visible même après redémarrage de l'app
+      return suggestion;
+    }
+    return { ok: false, error: `Dépôts trouvés pour « ${q} » mais aucun n'a de release Windows exploitable.` };
+  } catch (err) {
+    return { ok: false, error: `Recherche GitHub échouée : ${err.message}` };
+  }
+}
+
+// ---------------------------------------------------------------------
+// Suggestions IA en attente — persistées dans STATE_FILE (clé
+// 'aiSuggestions') pour que le client ne les perde PAS s'il ferme
+// l'app avant d'avoir coché/installé le composant proposé. Sans ça,
+// une suggestion trouvée par l'IA (searchGithubReleaseAsset) ne vivait
+// qu'en mémoire côté renderer (builder.html) : redémarrage = perdue,
+// obligeant l'IA à re-chercher sur GitHub à chaque session.
+// ---------------------------------------------------------------------
+function saveAiSuggestion(def) {
+  if (!def || !def.id) return;
+  const state = readState();
+  state.aiSuggestions = state.aiSuggestions || {};
+  state.aiSuggestions[def.id] = { ...def, foundAt: new Date().toISOString() };
+  writeState(state);
+}
+
+function listAiSuggestions() {
+  const state = readState();
+  return Object.values(state.aiSuggestions || {});
+}
+
+function removeAiSuggestion(id) {
+  const state = readState();
+  if (state.aiSuggestions && state.aiSuggestions[id]) {
+    delete state.aiSuggestions[id];
+    writeState(state);
+  }
+}
+
+// Installe un composant décrit par l'IA (voir def ci-dessus) — même pipeline
+// de téléchargement que les composants officiels (miroirs/curl/PowerShell en
+// secours), mais toujours appelé uniquement après confirmation explicite du
+// client dans l'UI (voir startComponentsInstall() dans builder.html).
+async function installDynamicComponent(def, onProgress) {
+  const url = def && (def.url || def.downloadUrl);
+  if (!def || !def.id || !url) throw new Error('Définition de composant invalide.');
+  def = { ...def, url };
+  if (!_isAllowedDynamicUrl(def.url)) {
+    throw new Error(`Source refusée : seuls les liens GitHub officiels sont acceptés (reçu : ${def.url}).`);
+  }
+  const id = def.id;
+  const destDir = path.join(DYNAMIC_ROOT, id);
+  fs.mkdirSync(destDir, { recursive: true });
+  const isZip = def.type === 'zip';
+  const destFileName = def.assetName || (isZip ? 'package.zip' : path.basename(new URL(def.url).pathname) || 'component.bin');
+  const tmpFile = path.join(DYNAMIC_ROOT, `_dl_${id}${path.extname(destFileName) || '.tmp'}`);
+
+  if (onProgress) onProgress({ id, status: 'downloading', pct: 0 });
+  await downloadWithFallback([def.url], tmpFile, (pct, received, total, message) => {
+    if (onProgress) onProgress({ id, status: 'downloading', pct: pct ?? undefined, received, total, message });
+  });
+
+  let checkFile;
+  if (isZip) {
+    if (onProgress) onProgress({ id, status: 'extracting', pct: 100 });
+    await extractZip(tmpFile, destDir);
+    fs.unlinkSync(tmpFile);
+    checkFile = destDir; // pas de fichier unique connu à l'avance dans une archive tierce
+  } else {
+    checkFile = path.join(destDir, destFileName);
+    fs.renameSync(tmpFile, checkFile);
+  }
+
+  const state = readState();
+  state['dyn:' + id] = { installedAt: new Date().toISOString(), source: def.url, ai: true };
+  writeState(state);
+  removeAiSuggestion(id); // une fois installée, ce n'est plus une suggestion "en attente"
+
+  log(`✅ ${def.label || id} (trouvé par IA) installé dans ${destDir}.`);
+  if (onProgress) onProgress({ id, status: 'done', pct: 100 });
+  return { ok: true, destDir, checkFile };
+}
+
+function getLastUpdateCheck() {
+  const state = readState();
+  return state.lastUpdateCheck || null;
+}
+
 module.exports = {
+  ROOT, // exposé pour que main.js transmette le même dossier (APKF_TOOLS_DIR) au process Python.
   COMPONENTS,
   listComponents,
   isInstalled,
   installComponent,
   installComponents,
+  updateComponent,
+  checkComponentUpdates,
+  getLastUpdateCheck,
+  // Composants trouvés par l'IA (hors registre, jamais auto-installés)
+  searchGithubReleaseAsset,
+  installDynamicComponent,
+  saveAiSuggestion,
+  listAiSuggestions,
+  removeAiSuggestion,
   // IA locale
   listLocalAiModels,
   isEngineInstalled,

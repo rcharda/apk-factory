@@ -8,7 +8,6 @@ set "TOOLS=%ROOT%\tools"
 set "JDK_DIR=%TOOLS%\jdk"
 set "PY_DIR=%TOOLS%\python"
 set "NODE_DIR=%TOOLS%\node"
-set "EAPP=%ROOT%\electron_app"
 
 echo.
 echo ============================================================
@@ -150,7 +149,7 @@ echo.
 :: ============================================================
 echo [5/5] Installation Electron...
 
-cd /d "%EAPP%"
+cd /d "%ROOT%"
 echo [INFO] npm install en cours (premiere fois : ~5 min)...
 call npm install
 if %errorlevel% neq 0 (

@@ -52,8 +52,64 @@ DEFAULT_ICON_BYTES = _make_solid_png(48, 48, 33, 150, 243, 255)
 
 PNG_MAGIC = b'\x89PNG\r\n\x1a\n'
 
-BASE_DIR = Path(__file__).parent
-TOOLS_DIR = BASE_DIR / "tools"
+BASE_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
+
+# ---------------------------------------------------------------------
+# IMPORTANT : setup.js installe les composants téléchargés (Node.js, JDK,
+# Android SDK, React Native CLI, Python embarqué, etc.) dans un dossier
+# INSCRIPTIBLE côté utilisateur (%APPDATA%\<app>\tools), pas dans
+# resources\tools (lecture seule une fois le programme installé sans
+# droits admin). server.py doit lire le MÊME dossier, sinon il ne trouve
+# jamais rien de ce que setup.js vient d'installer.
+#
+# main.js transmet APKF_TOOLS_DIR (= setupManager.ROOT) au process Python
+# au moment du spawn — voir startPythonServer() dans main.js.
+# ---------------------------------------------------------------------
+_env_tools_dir = os.environ.get("APKF_TOOLS_DIR")
+TOOLS_DIR = Path(_env_tools_dir) if _env_tools_dir else (BASE_DIR / "tools")
+
+# ---------------------------------------------------------------------
+# ESPACES DE TRAVAIL PRÊTS PAR TYPE D'APK ("templates/<type>/webroot/")
+# ---------------------------------------------------------------------
+# Chaque type d'APK (scratch, cordova, flutter, reactnative) a son propre
+# dossier-modèle déjà arrangé (index.html + css/style.css + js/app.js +
+# img/), stocké UNE FOIS sur disque à côté de server.py. Au lieu de générer
+# le contenu du webroot à la volée à chaque création de projet, on COPIE
+# ce dossier-modèle tel quel dans le webroot du nouveau projet. L'IA n'a
+# alors qu'à écraser/compléter des fichiers qui existent déjà à un chemin
+# connu d'avance — jamais de dossier vide, jamais de structure à deviner.
+# Ces dossiers ne sont PAS des sessions : ils ne sont jamais modifiés ici,
+# uniquement lus/copiés (template en lecture seule, source de vérité).
+TEMPLATES_DIR = BASE_DIR / "templates"
+
+
+def stage_webroot_from_template(apk_type: str, dest_dir: Path, logger=None):
+    """
+    Copie templates/<apk_type>/webroot/ vers dest_dir (le webroot réel du
+    nouveau projet : assets/ en scratch, www/ en cordova, assets/www/ en
+    flutter/reactnative...). dest_dir est créé si besoin ; s'il existe déjà
+    avec du contenu (ex: régénération), il est d'abord vidé pour repartir
+    d'un modèle propre et cohérent.
+
+    Retourne True si la copie a eu lieu, False si le dossier-modèle est
+    introuvable (dans ce cas l'appelant doit garder son ancien fallback
+    codé en dur, pour ne jamais bloquer une création de projet).
+    """
+    src = TEMPLATES_DIR / apk_type / "webroot"
+    if not src.is_dir():
+        if logger:
+            logger.log(f"⚠ Dossier-modèle introuvable pour '{apk_type}' ({src}) — "
+                        f"fallback sur le squelette généré en mémoire.")
+        return False
+    if dest_dir.exists():
+        shutil.rmtree(dest_dir)
+    shutil.copytree(src, dest_dir)
+    if logger:
+        logger.log(f"✅ Espace de travail '{apk_type}' initialisé depuis templates/{apk_type}/webroot/ "
+                    f"→ {dest_dir.name}/ (structure déjà prête, plus qu'à insérer les fichiers)")
+    return True
+
+
 SDK_DIR   = TOOLS_DIR / "android-sdk"
 WORK_DIR  = BASE_DIR / "workspace"
 OUTPUT_DIR = BASE_DIR / "output"
@@ -220,6 +276,39 @@ def get_op(token):
         OPS[token] = OpLogger()
     return OPS[token]
 
+# BUG CORRIGÉ (concurrence) : les routes /build-scratch, /build-native,
+# /build-twa, /cordova-generate, /flutter-generate, /rn-generate,
+# /build-cordova, /build-flutter, /build-rn faisaient toutes un
+# "if op.status == 'building': refuser" DANS LE HANDLER HTTP, mais ne
+# posaient le flag "building" qu'à l'intérieur du thread de fond
+# (do_build_*/do_generate_*), démarré juste après. Le serveur tourne en
+# ThreadingHTTPServer : deux requêtes quasi simultanées sur le même
+# endpoint pouvaient donc TOUTES LES DEUX lire un statut "libre" avant
+# qu'aucun thread n'ait eu le temps de poser "building" — et démarrer
+# chacune un build. Pire, plusieurs do_build_* faisaient en plus
+# `logger = OPS[token] = OpLogger()` : le second thread démarré
+# réassignait OPS[token] vers un NOUVEL objet, faisant perdre toute trace
+# (logs, résultat final) du premier build, qui continuait pourtant de
+# tourner en tâche de fond. `try_reserve_op` ferme cette fenêtre : le
+# contrôle ET la réservation ("building") se font atomiquement sous
+# verrou, dans le thread du handler HTTP, avant même de démarrer le
+# thread de build — donc jamais deux builds concurrents sur le même token.
+_OPS_START_LOCK = threading.Lock()
+
+def try_reserve_op(token):
+    """Retourne le logger réservé (status déjà passé à 'building') si ce
+    token était libre, sinon None si un build est déjà en cours pour ce
+    token. À utiliser à la place de 'op = get_op(token); if op.status ==
+    "building": ...' dans tout handler qui démarre un thread de build."""
+    with _OPS_START_LOCK:
+        op = get_op(token)
+        if op.status == "building":
+            return None
+        op.lines = []
+        op.result_file = None
+        op.status = "building"
+        return op
+
 
 # =============================================================
 # OUTILS SYSTÈME
@@ -249,6 +338,73 @@ def run_cmd_capture(cmd, logger, cwd=None, timeout=60):
         if line.strip(): logger.log("⚠ " + line)
     return r.returncode == 0, (r.stdout or "")
 
+# BUG CORRIGÉ : le téléchargement de secours du SDK Android (déclenché ici
+# quand apksigner est introuvable au moment de signer) utilisait une SEULE
+# URL google.com via urllib.request.urlretrieve, SANS timeout et SANS aucun
+# miroir de secours — exactement le même problème que celui corrigé côté
+# setup.js (Electron). Un seul lien mort ou une coupure réseau plantait tout
+# le build/signature sans recours. Cette fonction reprend la même stratégie
+# à 3 niveaux que downloadWithFallback() dans setup.js : plusieurs miroirs,
+# puis curl, puis PowerShell, avec un message temps réel via logger.log() à
+# chaque tentative pour que le client sache ce qui se passe.
+def _download_with_fallback(urls, dest_path, logger, timeout=120):
+    import urllib.request
+    last_err = None
+
+    for i, url in enumerate(urls):
+        try:
+            logger.log(f"Miroir {i + 1}/{len(urls)} : {url}")
+            req = urllib.request.Request(url, headers={"User-Agent": "APKFactoryPro-Server"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp, open(dest_path, "wb") as f:
+                shutil.copyfileobj(resp, f)
+            if Path(dest_path).stat().st_size < 1024:
+                raise Exception("Fichier téléchargé anormalement petit (lien probablement mort)")
+            logger.log(f"OK — {Path(dest_path).stat().st_size / 1024 / 1024:.1f} Mo")
+            return url
+        except Exception as e:
+            logger.log(f"❌ Échec miroir {i + 1}/{len(urls)} : {e}")
+            last_err = e
+            try: Path(dest_path).unlink(missing_ok=True)
+            except Exception: pass
+
+    for i, url in enumerate(urls):
+        try:
+            logger.log(f"Tentative curl ({i + 1}/{len(urls)})...")
+            r = subprocess.run(
+                ["curl", "-L", "--fail", "--ssl-no-revoke", "--max-redirs", "10", "-o", str(dest_path), url],
+                capture_output=True, timeout=timeout
+            )
+            if r.returncode == 0 and Path(dest_path).stat().st_size >= 1024:
+                logger.log(f"OK via curl — {Path(dest_path).stat().st_size / 1024 / 1024:.1f} Mo")
+                return url
+            raise Exception("curl a échoué ou fichier trop petit")
+        except Exception as e:
+            logger.log(f"❌ curl échoué ({i + 1}/{len(urls)}) : {e}")
+            last_err = e
+            try: Path(dest_path).unlink(missing_ok=True)
+            except Exception: pass
+
+    for i, url in enumerate(urls):
+        try:
+            logger.log(f"Tentative PowerShell ({i + 1}/{len(urls)})...")
+            ps_cmd = (
+                "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12;"
+                f"Invoke-WebRequest -Uri '{url}' -OutFile '{dest_path}' -UseBasicParsing -MaximumRedirection 10"
+            )
+            r = subprocess.run(["powershell.exe", "-NoProfile", "-Command", ps_cmd],
+                                capture_output=True, timeout=timeout)
+            if r.returncode == 0 and Path(dest_path).stat().st_size >= 1024:
+                logger.log(f"OK via PowerShell — {Path(dest_path).stat().st_size / 1024 / 1024:.1f} Mo")
+                return url
+            raise Exception("PowerShell a échoué ou fichier trop petit")
+        except Exception as e:
+            logger.log(f"❌ PowerShell échoué ({i + 1}/{len(urls)}) : {e}")
+            last_err = e
+            try: Path(dest_path).unlink(missing_ok=True)
+            except Exception: pass
+
+    raise Exception(f"Tous les téléchargements ont échoué ({len(urls)} miroir(s) × 3 méthodes). Dernière erreur : {last_err}")
+
 def _candidates(name):
     # setup.js installe certains outils "file" (ex: apktool) dans un SOUS-DOSSIER
     # portant le même nom que l'outil : tools/apktool/apktool.jar. On teste donc
@@ -261,6 +417,27 @@ def _candidates(name):
     yield TOOLS_DIR / (name + ".jar")
     yield TOOLS_DIR / (name + ".bat")
     yield TOOLS_DIR / (name + ".exe")
+    # BUG-KS-JDK — le JDK téléchargé par setup.js vit dans tools/jdk/bin/
+    # (java.exe, keytool.exe, jarsigner.exe...). Cet emplacement n'était
+    # JAMAIS testé ici : seuls build-tools/platform-tools (Android SDK)
+    # étaient couverts, donc find_tool("keytool") ratait systématiquement
+    # le keytool du JDK pourtant installé, et create_keystore_python()
+    # retombait à tort sur le fallback pip 'cryptography' (qui échoue sans
+    # accès internet pour ce Python embarqué). On cherche donc aussi dans
+    # tools/jdk/bin/ et tools/jdk*/bin/ (au cas où le dossier est versionné,
+    # ex: jdk-17.0.9).
+    jdk_bin = TOOLS_DIR / "jdk" / "bin"
+    if jdk_bin.exists():
+        for n in (name, name + ".exe"):
+            yield jdk_bin / n
+    if TOOLS_DIR.exists():
+        try:
+            for d in TOOLS_DIR.iterdir():
+                if d.is_dir() and d.name.lower().startswith("jdk") and d.name != "jdk":
+                    for n in (name, name + ".exe"):
+                        yield d / "bin" / n
+        except Exception:
+            pass
     bt = SDK_DIR / "build-tools"
     if bt.exists():
         for v in sorted([d for d in bt.iterdir() if d.is_dir()], reverse=True):
@@ -1204,7 +1381,32 @@ def list_sessions():
             })
     return out
 
-def delete_session(sid):
+def session_in_active_build(sid):
+    """True si un OPS[token] est actuellement 'building' sur cette session
+    précise. Utilisé pour empêcher toute suppression du dossier d'une
+    session en plein build."""
+    for op in OPS.values():
+        if op.status == "building" and op.session == sid:
+            return True
+    return False
+
+def delete_session(sid, force=False):
+    """
+    BUG CORRIGÉ : cette fonction supprimait le dossier d'une session sans
+    jamais vérifier si un build était en cours dessus (apktool/gradle/
+    flutter/cordova en train d'écrire ou de lire dans ce même dossier) —
+    un DELETE /session déclenché pendant une compilation pouvait faire
+    disparaître les fichiers sous les pieds du subprocess en cours
+    (échec cryptique, voire pire : sortie partielle silencieuse). On
+    refuse maintenant la suppression tant qu'un OPS[token] actif pointe
+    sur cette session, sauf si force=True est explicitement demandé par
+    l'appelant (ex: nettoyage interne après un build terminé/en erreur).
+    """
+    if not force and session_in_active_build(sid):
+        raise RuntimeError(
+            f"Session {sid} en cours de compilation — suppression refusée. "
+            f"Attends la fin du build (ou son échec) avant de la supprimer."
+        )
     sd = session_dir(sid)
     if sd.exists(): shutil.rmtree(sd)
 
@@ -1270,6 +1472,24 @@ def build_project_overview(sid):
     except Exception:
         pass
 
+    # CORRECTIF PERFORMANCE IA : jusqu'ici l'agent ne découvrait un
+    # assets/index.html vide/manquant qu'APRÈS un build_project complet
+    # (plusieurs minutes de compilation Gradle/apktool), via l'erreur
+    # "Compilation annulée : ... est vide" — un aller-retour entièrement
+    # gaspillé alors que get_project_overview est explicitement l'outil que
+    # l'agent appelle EN PREMIER sur toute session. On réutilise donc ici la
+    # même fonction faisant autorité (enforce_project_entrypoint, déjà
+    # utilisée avant chaque build et par GET /entrypoint) pour exposer
+    # directement l'état du point d'entrée dans l'overview : l'agent voit
+    # ainsi "entrypoint.contentMissing" dès son tout premier appel, avant
+    # même d'envisager build_project, et peut écrire le vrai contenu tout
+    # de suite au lieu de le découvrir après un build raté.
+    entrypoint = {"kind": "unknown", "activeIndexPath": None, "removed": [], "contentMissing": False}
+    try:
+        entrypoint = enforce_project_entrypoint(sid, kind_hint=(origin or None))
+    except Exception:
+        pass
+
     MAX_TREE_ITEMS = 800  # on tronque pour ne pas noyer le modèle de contexte
     return {
         "session": sid,
@@ -1285,10 +1505,11 @@ def build_project_overview(sid):
         "configFiles": configs,
         "smaliFactsCount": smali_count,
         "health": health,
+        "entrypoint": entrypoint,
     }
 
 def write_hybrid_session_meta(sid, origin, config):
-    """Écrit session.json pour une session Cordova/Flutter/React Native,
+    """Écrit session.json pour une session Cordova/Flutter/React Native/Native,
     afin qu'elle apparaisse dans /sessions (panneau Sessions) et soit
     reconnue par l'explorer/config-panel comme une session normale,
     au même titre que scratch/template/décompilé."""
@@ -1297,7 +1518,7 @@ def write_hybrid_session_meta(sid, origin, config):
         "package": (config.get("packageName") or "").strip(),
         "packageOld": (config.get("packageName") or "").strip(),
         "appName": (config.get("appName") or "MonApp").strip(),
-        "origin": origin,  # "cordova" | "flutter" | "reactnative"
+        "origin": origin,  # "cordova" | "flutter" | "reactnative" | "native"
     }
     (session_dir(sid) / "session.json").write_text(json.dumps(meta), encoding="utf-8")
 
@@ -1307,6 +1528,13 @@ PROJECT_ROOT_SUBDIRS = [
     "cordova_project",
     "flutter_project",
     "rn_project",
+    # CORRECTIF : "native_project" (voir native_project_dir) manquait ici.
+    # Conséquence concrète : resolve_session_root() ne trouvait AUCUN de ces
+    # noms pour une session native, retombait sur source_dir(sid) qui
+    # n'existe pas pour ce pipeline, et /tree|/file renvoyaient donc un
+    # projet vide/introuvable pour tout APK natif généré par do_build_native
+    # — impossible à parcourir/éditer après coup dans l'explorateur.
+    "native_project",
 ]
 
 def resolve_session_root(sid):
@@ -1338,6 +1566,45 @@ def list_tree_all(sid):
         items.append({'path': rel, 'type': 'dir' if p.is_dir() else 'file',
                       'size': p.stat().st_size if p.is_file() else 0})
     return items
+
+# ---------------------------------------------------------------------
+# /template-tree : liste le VRAI contenu, tel qu'il existe RÉELLEMENT sur
+# le disque dans templates/<type>/(webroot|...), SANS avoir besoin d'une
+# session ni d'un projet créé. Sert à afficher dans l'explorateur de gauche
+# les vrais dossiers/sous-dossiers et les vrais chemins que l'IA utilisera
+# pour injecter ses fichiers — dès le chargement de la page, avant même la
+# première création de projet — plutôt qu'une liste devinée côté client.
+# ---------------------------------------------------------------------
+TEMPLATE_TREE_ROOTS = {
+    'scratch':     TEMPLATES_DIR / 'scratch' / 'webroot',
+    'cordova':     TEMPLATES_DIR / 'cordova' / 'webroot',
+    'flutter':     TEMPLATES_DIR / 'flutter' / 'webroot',
+    'reactnative': TEMPLATES_DIR / 'reactnative' / 'webroot',
+    'native':      TEMPLATES_DIR / 'native',
+}
+
+# Où ce contenu-modèle atterrit RÉELLEMENT une fois un projet généré (voir
+# stage_webroot_from_template / stage_native_skeleton) — c'est le vrai
+# préfixe de chemin que l'IA doit utiliser dans write_file pour ce type.
+TEMPLATE_MOUNT_PREFIX = {
+    'scratch':     'assets/',
+    'cordova':     'www/',
+    'flutter':     'assets/www/',
+    'reactnative': 'android/app/src/main/assets/www/',
+    'native':      'app/src/main/ (kotlin/<package>/MainActivity.kt + res/)',
+    'twa':         None,  # pas de dossier de fichiers pour TWA
+}
+
+def list_template_tree(apk_type):
+    root = TEMPLATE_TREE_ROOTS.get(apk_type)
+    if not root or not root.is_dir():
+        return {'exists': False, 'items': []}
+    items = []
+    for p in sorted(root.rglob('*'), key=lambda x: str(x).lower()):
+        rel = str(p.relative_to(root)).replace('\\', '/')
+        items.append({'path': rel, 'type': 'dir' if p.is_dir() else 'file',
+                      'size': p.stat().st_size if p.is_file() else 0})
+    return {'exists': True, 'items': items}
 
 def read_file_safe(sid, rel_path):
     sdir, target = _safe_target(sid, rel_path)
@@ -1383,7 +1650,294 @@ def _session_origin(sid):
         pass
     return ""
 
+# =============================================================
+# ANTI PAGE-BLANCHE — un SEUL dossier "racine web" actif par projet
+# =============================================================
+# Chaque type d'APK charge son HTML/CSS/JS depuis UN SEUL emplacement bien
+# précis (assets/ pour scratch, www/ pour Cordova/React Native,
+# assets/www/ pour un Flutter-WebView, AUCUN pour un Flutter natif). Le bug
+# de page blanche vient systématiquement du même schéma : un fichier
+# index.html/style.css/app.js écrit (par l'IA ou à la main) dans le MAUVAIS
+# dossier reste un orphelin silencieux — la WebView ne le charge jamais,
+# mais rien ne prévient personne. `enforce_project_entrypoint` corrige ça de
+# façon systématique : dès qu'on connaît le type réel du projet, elle
+# SUPPRIME activement ces 4 noms de fichiers dans tous les AUTRES dossiers
+# racines possibles, et signale (sans jamais écrire de fichier à la place)
+# si le dossier actif n'a pas de contenu réel — c'est _assert_entrypoint_ready
+# qui bloque ensuite la compilation dans ce cas, au lieu de laisser passer un
+# APK dont l'unique "contenu" serait une page de secours générée.
+_WEBROOT_ENTRY_NAMES = ("index.html", "style.css", "app.js", "script.js")
+_WEBROOT_CANDIDATE_PREFIXES = ["", "www/", "assets/", "assets/www/", "android/app/src/main/assets/www/"]
+
+def _flutter_uses_webview(root):
+    """Lit pubspec.yaml + lib/main.dart pour savoir si CE projet Flutter
+    utilise réellement une WebView, plutôt que de le supposer dès que
+    pubspec.yaml existe (cause du bug : un Flutter NATIF avec de vrais
+    écrans Dart n'a aucune WebView, donc aucun dossier web actif)."""
+    try:
+        pubspec = (root / "pubspec.yaml")
+        main_dart = (root / "lib" / "main.dart")
+        pubspec_text = pubspec.read_text(encoding="utf-8", errors="ignore") if pubspec.exists() else ""
+        main_dart_text = main_dart.read_text(encoding="utf-8", errors="ignore") if main_dart.exists() else ""
+        if "webview_flutter" in pubspec_text:
+            return True
+        if re.search(r'WebView(Widget|Controller)?\s*\(', main_dart_text):
+            return True
+    except Exception:
+        pass
+    return False
+
+def enforce_project_entrypoint(sid, kind_hint=None, logger=None):
+    """Détermine le SEUL dossier racine web actif pour cette session selon
+    son type réel, supprime les fichiers index.html/style.css/app.js/
+    script.js orphelins dans tous les AUTRES dossiers candidats, et détecte
+    si le dossier actif contient un contenu réel (sans jamais écrire de
+    fichier de secours à la place — voir contentMissing dans le rapport
+    retourné). Appelée après chaque génération de projet (create_scratch_session,
+    generate_cordova_project, generate_flutter_project,
+    generate_react_native_project...) et avant chaque recompilation, pour
+    rattraper aussi les modifications faites après coup par l'IA/le client.
+    Ne touche JAMAIS à un fichier autre que ces 4 noms précis : aucun risque
+    pour le code natif (lib/, android/, smali/, src/...).
+
+    Retourne un dict décrivant le résultat — c'est LA réponse faisant
+    autorité sur "quel est le bon chemin", exposée aussi via GET /entrypoint
+    pour que l'agent IA la lise au lieu de la redéviner de son côté :
+      {
+        "kind": "scratch" | "cordova" | "reactnative" | "flutter-webview" | "flutter-native" | "unknown",
+        "activeIndexPath": "assets/index.html" | "www/index.html" | "assets/www/index.html" | None,
+        "removed": [...chemins supprimés...],
+        "contentMissing": bool,
+      }
+    """
+    def _log(msg):
+        if logger is not None:
+            try: logger.log(msg)
+            except Exception: pass
+
+    report = {"kind": "unknown", "activeIndexPath": None, "removed": [], "contentMissing": False}
+    try:
+        root = resolve_session_root(sid)
+        if not root.exists():
+            return report
+        origin = kind_hint if kind_hint is not None else _session_origin(sid)
+
+        if origin == "cordova":
+            active_prefix = "www/"; report["kind"] = "cordova"
+        elif origin == "reactnative":
+            # BUG CORRIGÉ : generate_react_native_project() et
+            # _apply_config_reactnative() écrivent TOUS LES DEUX dans
+            # android/app/src/main/assets/www/ (seul dossier réellement
+            # empaqueté par Gradle et chargé par la WebView RN via
+            # file:///android_asset/www/index.html) — jamais dans un
+            # "www/" à la racine du projet. Cette fonction surveillait
+            # jusqu'ici le mauvais dossier (racine), donc le vrai fichier
+            # chargé par l'app n'était ni vérifié ni réparé en cas de
+            # contenu vide/cassé : page blanche silencieuse.
+            active_prefix = "android/app/src/main/assets/www/"
+            report["kind"] = "reactnative"
+        elif origin == "flutter":
+            uses_wv = _flutter_uses_webview(root)
+            active_prefix = "assets/www/" if uses_wv else None
+            report["kind"] = "flutter-webview" if uses_wv else "flutter-native"
+        elif origin == "":
+            # BUG CORRIGÉ : le mode scratch recouvre en réalité 3
+            # sous-types différents (HTML collé → assets/index.html ;
+            # site zippé → assets/www/index.html ; URL distante → aucun
+            # fichier local), mais cette fonction supposait TOUJOURS
+            # "assets/" comme dossier actif. Pour un projet en mode
+            # "site zip", ça faisait traiter assets/www/index.html — le
+            # fichier réellement chargé par la WebView compilée — comme
+            # un orphelin dans le mauvais dossier, et le SUPPRIMER : page
+            # blanche garantie. On lit maintenant le vrai chemin loadUrl()
+            # déjà compilé dans MainActivity.smali (seule source fiable de
+            # ce que l'app va réellement charger) au lieu de le deviner.
+            report["kind"] = "scratch"
+            active_prefix = "assets/"
+            try:
+                smali_matches = list(root.glob("smali/**/MainActivity.smali"))
+                if smali_matches:
+                    smali_txt = smali_matches[0].read_text(encoding="utf-8", errors="ignore")
+                    if "android_asset/www/index.html" in smali_txt:
+                        active_prefix = "assets/www/"
+                    elif "android_asset/index.html" in smali_txt:
+                        active_prefix = "assets/"
+                    else:
+                        # Mode URL distante : aucun webroot local à charger,
+                        # rien à supprimer ni de fallback à écrire.
+                        active_prefix = None
+            except Exception:
+                pass
+        else:
+            # native / twa / origine inconnue : pipeline dédié, pas de
+            # dossier "racine web" géré par cette fonction.
+            return report
+
+        removed = []
+        for prefix in _WEBROOT_CANDIDATE_PREFIXES:
+            if prefix == active_prefix:
+                continue
+            for name in _WEBROOT_ENTRY_NAMES:
+                p = (root / prefix / name) if prefix else (root / name)
+                try:
+                    if p.is_file():
+                        p.unlink()
+                        removed.append(str(p.relative_to(root)).replace("\\", "/"))
+                except Exception:
+                    pass
+        report["removed"] = removed
+        if removed:
+            _log(f"🧹 Fichiers webview orphelins supprimés (mauvais dossier, cause habituelle de page blanche) : {', '.join(removed)}")
+
+        if active_prefix is not None:
+            index_rel = f"{active_prefix}index.html" if active_prefix else "index.html"
+            report["activeIndexPath"] = index_rel
+            index_path = root / index_rel
+            # BUG CORRIGÉ : cette fonction écrivait auparavant une page de
+            # secours "⚠ Contenu manquant" directement dans index.html dès
+            # que le contenu était vide/absent. Ce fichier devenait alors un
+            # contenu de projet réel et pouvait être empaqueté tel quel dans
+            # l'APK si le client compilait sans s'en rendre compte — donc un
+            # vrai bug (APK "réussi" qui n'affiche que l'avertissement), pas
+            # un garde-fou. On se contente maintenant de CONSTATER l'absence
+            # de contenu réel (report["contentMissing"]) sans jamais écrire
+            # de fichier ; c'est _assert_entrypoint_ready qui bloque ensuite
+            # la compilation en levant une erreur explicite.
+            content_missing = True
+            if index_path.is_file():
+                try:
+                    txt = index_path.read_text(encoding="utf-8", errors="ignore")
+                    m = re.search(r'<body[^>]*>([\s\S]*?)</body>', txt, re.I)
+                    inner = re.sub(r'<!--[\s\S]*?-->', '', m.group(1) if m else '').strip()
+                    content_missing = not inner
+                except Exception:
+                    content_missing = False  # fichier illisible : on n'y touche pas
+            report["contentMissing"] = content_missing
+            if content_missing:
+                _log(f"⚠ {index_rel} manquant/vide — aucun contenu réel détecté. Chemin correct à éditer : {index_rel}")
+            else:
+                _log(f"✅ Dossier racine web confirmé : {index_rel}")
+        else:
+            # Flutter natif : aucune WebView attendue — juste un contrôle
+            # de bon sens sur le vrai point d'entrée Dart, à titre informatif.
+            main_dart = root / "lib" / "main.dart"
+            report["activeIndexPath"] = None
+            if main_dart.is_file():
+                try:
+                    src = main_dart.read_text(encoding="utf-8", errors="ignore")
+                    if "runApp(" not in src:
+                        _log("⚠ lib/main.dart ne contient pas d'appel runApp(...) — l'app affichera probablement un écran blanc. Chemin correct à éditer : lib/main.dart (et lib/screens/*.dart).")
+                    else:
+                        _log("✅ Projet Flutter natif confirmé — chemin correct à éditer : lib/main.dart (et lib/screens/*.dart), PAS de fichier HTML.")
+                except Exception:
+                    pass
+    except Exception as e:
+        _log(f"⚠ Vérification de la structure du projet ignorée (non bloquant) : {e}")
+    return report
+
+def _assert_entrypoint_ready(sid, kind_hint, logger):
+    """
+    Appelle enforce_project_entrypoint puis lève une erreur claire si le
+    contenu réel est manquant (contentMissing=True) — À N'UTILISER QU'AU
+    MOMENT DE COMPILER, jamais juste après une génération "sans build" où
+    le client/l'IA doit encore avoir la main pour écrire le vrai contenu.
+    BUG DE FOND corrigé ici : sans ce garde-fou, un build pouvait se
+    terminer avec status="done" et produire un APK installable sans aucun
+    contenu réel — un échec silencieux déguisé en succès, pour TOUS les
+    types de projet (scratch, cordova, flutter-webview, react native).
+    enforce_project_entrypoint ne génère plus de page de secours à écrire
+    dans le projet (cela créait elle-même un bug : un APK "réussi" dont
+    l'unique contenu aurait été cette page générée) ; elle se contente de
+    constater l'absence de contenu, et c'est cette fonction qui bloque la
+    compilation en conséquence. Retourne le report si tout va bien (pour
+    usage éventuel par l'appelant).
+    """
+    report = enforce_project_entrypoint(sid, kind_hint=kind_hint, logger=logger)
+    if report.get("contentMissing"):
+        path_hint = report.get("activeIndexPath") or "le fichier d'entrée du projet"
+        raise RuntimeError(
+            f"Compilation annulée : {path_hint} est vide ou n'a jamais été rempli avec le vrai "
+            f"contenu de l'app. Écris le vrai contenu dans {path_hint} (via write_file) avant "
+            f"de relancer la compilation."
+        )
+    return report
+
+# BUG DE FOND corrigé ici (voir aussi le garde-fou jumeau côté client dans
+# agent-engine.js/enforceApkPathMatch) : rien côté SERVEUR n'empêchait
+# d'écrire un fichier propre à un framework (pubspec.yaml, *.dart,
+# config.xml, package.json+App.js) dans une session dont l'origin réel
+# (session.json) est différent. Le garde-fou client peut être contourné
+# (appel direct à l'API, extension désactivée, désync du cache
+# localStorage) : on rejoue donc la même vérification ici, qui FAIT
+# AUTORITÉ, indépendamment de ce que croit le client.
+_FRAMEWORK_MARKER_CHECKS = {
+    "flutter": lambda p: p == "pubspec.yaml" or p.endswith("/pubspec.yaml") or p.endswith(".dart"),
+    "cordova": lambda p: p == "config.xml" or p.endswith("/config.xml"),
+    "reactnative": lambda p: (
+        p == "package.json" or p.endswith("/package.json")
+        or re.search(r'(^|/)App\.(js|tsx|jsx)$', p) is not None
+    ),
+}
+
+def _enforce_framework_marker(sid, rel_path):
+    clean = str(rel_path).replace("\\", "/").lstrip("/")
+    origin = _session_origin(sid)
+    for fw_mode, is_marker in _FRAMEWORK_MARKER_CHECKS.items():
+        if fw_mode == origin:
+            continue
+        if is_marker(clean):
+            raise ValueError(
+                f"Fichier NON écrit : '{rel_path}' — ce fichier est propre au framework '{fw_mode}', "
+                f"mais cette session est de type '{origin or 'inconnu'}'. L'écrire ici produirait un projet "
+                f"hybride incohérent qui ne compilera jamais correctement. Crée d'abord une VRAIE session "
+                f"'{fw_mode}' (create_project côté agent, ou le bouton dédié côté interface), puis réécris ce "
+                f"fichier — et tous les autres fichiers {fw_mode} déjà prévus — dans cette nouvelle session."
+            )
+
+def cleanup_mismatched_framework_files(sid, logger=None):
+    """Répare une session déjà polluée par CE bug précis (fichiers d'un
+    framework écrits avant que le garde-fou n'existe, ou avant qu'il ne
+    couvre ce cas). Parcourt l'arbre de la session et SUPPRIME tout fichier
+    qui matche un marqueur de framework différent de l'origin réel de la
+    session (voir _FRAMEWORK_MARKER_CHECKS) — jamais l'inverse (on ne
+    touche jamais aux fichiers du BON framework). Retourne la liste des
+    chemins supprimés, pour affichage/logs. Sans risque pour le code
+    natif/smali : seuls .dart, pubspec.yaml, config.xml, package.json et
+    App.js/tsx/jsx sont concernés, jamais autre chose.
+    """
+    def _log(msg):
+        if logger is not None:
+            try: logger.log(msg)
+            except Exception: pass
+
+    origin = _session_origin(sid)
+    root = resolve_session_root(sid)
+    removed = []
+    if not root.exists():
+        return removed
+    for p in root.rglob("*"):
+        if not p.is_file():
+            continue
+        try:
+            rel = str(p.relative_to(root)).replace("\\", "/")
+        except Exception:
+            continue
+        for fw_mode, is_marker in _FRAMEWORK_MARKER_CHECKS.items():
+            if fw_mode == origin:
+                continue
+            if is_marker(rel):
+                try:
+                    p.unlink()
+                    removed.append(rel)
+                except Exception:
+                    pass
+                break
+    if removed:
+        _log(f"🧹 Nettoyage session incohérente : {len(removed)} fichier(s) d'un autre framework supprimé(s) : {', '.join(removed[:20])}" + (" ..." if len(removed) > 20 else ""))
+    return removed
+
 def write_file_safe(sid, rel_path, content):
+    _enforce_framework_marker(sid, rel_path)
     if str(rel_path).endswith('.smali'):
         smali_errors = _smali_quick_check(rel_path, content)
         if smali_errors:
@@ -1407,6 +1961,24 @@ def write_file_safe(sid, rel_path, content):
             "Java/Kotlin ici. N'écris jamais de .java/.kt dans ce projet : édite le .smali existant "
             "(cherche-le avec search_project ou get_smali_facts) au lieu de créer un fichier Java. "
             "Le Java/Kotlin n'est utilisable que dans un projet créé en mode cordova/flutter/reactnative."
+        )
+    # BUG constaté (suite du précédent) : après un refus de .java/.kt, l'IA
+    # continuait parfois dans la même impasse en écrivant des layouts natifs
+    # (res/layout/*.xml, res/menu/*.xml...) — tout aussi inertes sans
+    # Activity Kotlin/Java pour les inflater, donc du temps perdu sur une
+    # architecture impossible ici. Pour ce type de session, TOUTE
+    # fonctionnalité (y compris un jeu) doit être codée en HTML5/CSS/JS
+    # (Canvas pour la partie graphique) dans le webroot actif — on bloque
+    # ces fichiers aussi et on redirige explicitement vers la bonne approche
+    # au lieu de laisser l'IA s'entêter sur du natif inutilisable.
+    if re.match(r'^res/(layout|menu|navigation)/', str(rel_path).replace('\\', '/')) and _session_origin(sid) not in _GRADLE_JAVA_ORIGINS:
+        raise ValueError(
+            "Fichier NON écrit : '" + str(rel_path) + "' — ce type de projet n'a aucune Activity "
+            "Kotlin/Java pour inflater un layout natif, ce fichier serait donc totalement inerte. "
+            "Pour CE type de projet, toute fonctionnalité (y compris un jeu) doit être codée en "
+            "HTML5/CSS/JS dans le webroot actif de la WebView (assets/index.html ou assets/www/index.html "
+            "selon le projet — utilise get_project_overview pour connaître le bon chemin) ; utilise "
+            "l'élément <canvas> + JavaScript pour la partie graphique/jeu plutôt qu'un layout Android natif."
         )
     sdir, target = _safe_target(sid, rel_path)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -1633,6 +2205,189 @@ def rename_with_refs(sid, rel, new_rel):
     return {"refsUpdated": refs_updated, "nameAmbiguous": name_ambiguous}
 
 
+# =============================================================
+# ESPACE DE TRAVAIL UNIVERSEL — détection du type d'APK décompilé
+# =============================================================
+# But : accepter N'IMPORTE QUEL APK (peu importe avec quoi il a été
+# construit à l'origine) dans un seul espace de travail générique, puis
+# dire au client (et à l'IA) avec QUOI ce projet a été fait, pour orienter
+# la suite (quels outils installer, quels fichiers éditer). Détection
+# 100% déterministe (empreintes de fichiers connues) — aucune IA requise
+# pour CETTE étape ; l'IA prend ensuite le relais uniquement pour vérifier
+# précisément quels outils manquent (check_missing_components) et chercher
+# ceux qui ne sont pas dans le registre connu (search_missing_component,
+# GitHub/miroirs) — jamais l'inverse.
+def detect_decompiled_apk_type(sid):
+    sdir = source_dir(sid)
+    if not sdir.exists():
+        return {"type": "none", "requiredTools": [], "markersFound": {}}
+
+    assets_www      = sdir / "assets" / "www"
+    has_www         = assets_www.exists()
+    has_cordova_js  = (assets_www / "cordova.js").exists() or (assets_www / "cordova_plugins.js").exists()
+    has_flutter_ast = (sdir / "assets" / "flutter_assets").exists()
+    has_flutter_lib = (sdir / "lib").exists() and any(sdir.glob("lib/*/libflutter.so"))
+    has_rn_bundle   = (sdir / "assets" / "index.android.bundle").exists()
+    smali_root      = sdir / "smali"
+    has_cordova_pkg = (smali_root / "org" / "apache" / "cordova").exists()
+    has_flutter_pkg = (smali_root / "io" / "flutter").exists()
+    has_react_pkg   = (smali_root / "com" / "facebook" / "react").exists()
+    has_twa_pkg     = (smali_root / "com" / "google" / "androidbrowserhelper").exists()
+    has_assetlinks  = (sdir / "res" / "raw").exists() and any((sdir / "res" / "raw").glob("assetlinks*"))
+
+    if has_flutter_ast or has_flutter_lib or has_flutter_pkg:
+        apk_type = "flutter"
+    elif has_rn_bundle or has_react_pkg:
+        apk_type = "reactnative"
+    elif has_cordova_js or has_cordova_pkg:
+        apk_type = "cordova"
+    elif has_twa_pkg or has_assetlinks:
+        apk_type = "twa"
+    elif has_www:
+        apk_type = "webview_custom"   # ex: apps "Site → App" maison, comme ce projet-ci
+    else:
+        apk_type = "native"
+
+    LABELS = {
+        "flutter":        "Flutter",
+        "reactnative":    "React Native",
+        "cordova":        "Cordova",
+        "twa":            "Trusted Web Activity (TWA)",
+        "webview_custom": "WebView personnalisée (type Site → App)",
+        "native":         "Natif Java/Kotlin",
+    }
+    REQUIRED_TOOLS = {
+        "flutter":        ["JDK", "Android SDK", "Gradle", "Flutter SDK"],
+        "reactnative":    ["JDK", "Android SDK", "Gradle", "Node.js", "React Native CLI"],
+        "cordova":        ["JDK", "Android SDK", "Gradle", "Node.js", "Cordova CLI"],
+        "twa":            ["JDK", "Android SDK", "Gradle", "Bubblewrap"],
+        "webview_custom": ["JDK", "Android SDK", "Gradle", "Apktool"],
+        "native":         ["JDK", "Android SDK", "Gradle", "Kotlin"],
+    }
+
+    return {
+        "type": apk_type,
+        "label": LABELS[apk_type],
+        "requiredTools": REQUIRED_TOOLS[apk_type],
+        "markersFound": {
+            "hasWww": has_www, "hasCordovaJs": has_cordova_js,
+            "hasFlutterAssets": has_flutter_ast, "hasFlutterLib": has_flutter_lib,
+            "hasReactBundle": has_rn_bundle, "hasTwaMarkers": has_twa_pkg or has_assetlinks,
+        },
+    }
+
+
+# =============================================================
+# SUPPRESSION FORCÉE + DÉPENDANCES — 100% déterministe, SANS IA
+# =============================================================
+# Contexte : le bouton "Supprimer avec l'IA" délègue la suppression à
+# l'agent, qui peut se tromper (oublier d'appeler delete_path sur le bon
+# fichier, ou croire avoir supprimé alors que non — cas observé : un
+# fichier smali watermark laissé intact alors que l'IA annonçait l'avoir
+# supprimé). Cette fonction ne dépend d'aucun modèle : elle supprime le
+# fichier pour de vrai (vérifié après coup), puis scanne tout le projet
+# en texte brut (comme search_content/rename_with_refs) pour retrouver
+# les dépendances, avec 2 comportements garantis :
+#  1) Nettoyage AUTOMATIQUE et sûr, mais UNIQUEMENT pour un motif smali
+#     bien identifié et sans ambiguïté : "instancier puis exécuter
+#     immédiatement" (new-instance + invoke-direct <init> + invoke du
+#     Runnable via post/postDelayed/run/execute) — le cas typique des
+#     classes watermark comme "MainActivity$g" (Runnable jetable posté
+#     puis jamais réutilisé). Ce motif est retiré en bloc car il ne
+#     laisse aucun registre "orphelin" derrière lui.
+#  2) Pour tout le reste (référence trouvée mais motif non reconnu),
+#     on ne devine PAS — on liste précisément fichier + ligne pour revue
+#     manuelle ou via le badge ✨ IA, plutôt que de risquer de casser la
+#     compilation avec une suppression de ligne aveugle.
+def _extract_smali_class_name(text):
+    m = re.search(r'^\.class[ \t]+(?:\S+[ \t]+)*(L[\w/$]+;)[ \t]*$', text, re.M)
+    return m.group(1) if m else None
+
+def force_delete_with_refs(sid, rel):
+    sdir, target = _safe_target(sid, rel)
+    if not target.exists():
+        raise FileNotFoundError("Fichier ou dossier introuvable")
+
+    is_dir = target.is_dir()
+    old_name = target.name
+    old_rel_fwd = rel.replace("\\", "/")
+
+    class_slash = None
+    class_dot = None
+    if not is_dir and target.suffix.lower() == ".smali":
+        try:
+            txt = target.read_text(encoding="utf-8")
+            class_slash = _extract_smali_class_name(txt)
+            if class_slash:
+                class_dot = class_slash[1:-1].replace("/", ".")
+        except (UnicodeDecodeError, OSError):
+            pass
+
+    # 1) Suppression réelle — jamais déléguée à l'IA, jamais "supposée faite".
+    if is_dir:
+        shutil.rmtree(target)
+    else:
+        target.unlink()
+    deleted_confirmed = not target.exists()
+
+    # 2) Motif sûr de nettoyage auto (Runnable smali instancié + exécuté
+    #    une seule fois, résultat jamais réutilisé ensuite).
+    runnable_block_re = None
+    if class_slash:
+        cs = re.escape(class_slash)
+        runnable_block_re = re.compile(
+            r'[ \t]*new-instance (v\d+|p\d+), ' + cs + r'[ \t]*\r?\n'
+            r'[ \t]*invoke-direct \{[^}\n]*\}, ' + cs + r'-><init>\([^)]*\)V[ \t]*\r?\n'
+            r'(?:[ \t]*\r?\n)?'
+            r'[ \t]*invoke-(?:virtual|interface) \{[^}\n]*\1[^}\n]*\}, [\w/$;.<>]+->(?:post|postDelayed|run|execute)\([^)]*\)[A-Za-z\[\];]*[ \t]*\r?\n?'
+        )
+
+    references = []
+    auto_cleaned = []
+
+    for f in sdir.rglob("*"):
+        if not f.is_file(): continue
+        if f.suffix.lower() not in TEXT_EXTENSIONS and f.suffix != "": continue
+        try:
+            if f.stat().st_size > MAX_TEXT_SIZE: continue
+            text = f.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+
+        matched = (old_name in text or old_rel_fwd in text or
+                   (class_slash and class_slash in text) or
+                   (class_dot and class_dot in text))
+        if not matched:
+            continue
+
+        rel_f = str(f.relative_to(sdir)).replace("\\", "/")
+
+        cleaned_text, n = (runnable_block_re.subn('', text) if runnable_block_re else (text, 0))
+        if n:
+            try:
+                f.write_text(cleaned_text, encoding="utf-8")
+                auto_cleaned.append({"path": rel_f, "blocksRemoved": n})
+                text = cleaned_text
+            except OSError:
+                pass
+
+        for lineno, line in enumerate(text.split("\n"), start=1):
+            if (old_name in line or old_rel_fwd in line or
+                    (class_slash and class_slash in line) or
+                    (class_dot and class_dot in line)):
+                snippet = line.strip()
+                if len(snippet) > 240: snippet = snippet[:240] + "…"
+                references.append({"path": rel_f, "line": lineno, "text": snippet})
+
+    return {
+        "deleted": rel,
+        "deletedConfirmed": deleted_confirmed,
+        "classDetected": class_slash,
+        "autoCleaned": auto_cleaned,
+        "remainingReferences": references,
+    }
+
+
 def replace_in_file_line(sid, rel_path, line_no, old_text, new_text):
     """Remplace le contenu d'une ligne précise (vérifie l'ancien contenu pour éviter
     d'écraser un fichier modifié entre-temps par autre chose)."""
@@ -1822,6 +2577,476 @@ def apply_smali_fact(sid, fact_id, new_value):
 
 
 # =============================================================
+# MODE PROFONDEUR — désactiver TOUT un bloc affiché (pas juste son texte)
+# =============================================================
+# Vider un const-string (apply_smali_fact avec "") ne supprime que le texte :
+# le popup/dialogue qui l'affiche (fond, boutons, marges...) reste visible,
+# juste vide. Ici on va plus loin : on repère la méthode smali qui ENGLOBE
+# la ligne de texte cliquée (typiquement la méthode qui construit et
+# affiche le dialogue/bandeau), et on la neutralise en lui injectant un
+# "return-void" tout au début — la méthode ne fait alors plus RIEN du tout
+# quand elle est appelée (plus de dialogue, plus de fond blanc, plus de
+# boutons), sans toucher au reste de la classe ni risquer de casser le
+# build (aucune ligne n'est supprimée, seulement une short-circuit ajoutée).
+# Limite assumée : uniquement sûr pour une méthode de retour void (V) —
+# pour tout le reste, on refuse et on renvoie une explication claire plutôt
+# que de deviner une valeur de retour.
+_RE_METHOD_START = re.compile(r'^\s*\.method\b.*\)([\[A-Za-z][\w/$;\[]*)\s*$')
+_RE_METHOD_END = re.compile(r'^\s*\.end method\s*$')
+_RE_LOCALS_OR_REGISTERS = re.compile(r'^\s*\.(locals|registers)\s+\d+\s*$')
+
+def find_enclosing_smali_method(lines, at_idx):
+    """Retourne (start_idx, end_idx, return_type) de la méthode .method/.end
+    method qui contient la ligne at_idx (index 0-based), ou None."""
+    start = None
+    for i in range(at_idx, -1, -1):
+        if _RE_METHOD_END.match(lines[i]) and i != at_idx:
+            break  # on a dépassé la méthode précédente sans trouver de .method : pas englobé
+        m = _RE_METHOD_START.match(lines[i])
+        if m:
+            start = i
+            ret_type = m.group(1)
+            break
+    if start is None:
+        return None
+    end = None
+    for i in range(start, len(lines)):
+        if _RE_METHOD_END.match(lines[i]):
+            end = i
+            break
+    if end is None or end < at_idx:
+        return None
+    return start, end, ret_type
+
+def disable_ui_fact_block(sid, fact_id):
+    """Neutralise toute la méthode smali qui affiche l'élément détecté par
+    /ui-facts (id au format 'chemin/relatif.smali:ligne'), pour désactiver
+    tout le bloc visuel (popup, fond, boutons...) et pas juste son texte."""
+    if fact_id.startswith("strres::") or fact_id.startswith("layout::"):
+        raise ValueError(
+            "Cette action n'est possible que pour un texte détecté dans le code (smali) — "
+            "ce texte vient de strings.xml ou d'un layout, qui n'a pas de méthode à désactiver ici."
+        )
+    rel, lineno_s = fact_id.rsplit(":", 1)
+    lineno = int(lineno_s)
+    sdir, target = _safe_target(sid, rel)
+    if not target.is_file():
+        raise FileNotFoundError("Fichier introuvable — relancez un scan")
+    lines = target.read_text(encoding="utf-8").split("\n")
+    idx = lineno - 1
+    if idx < 0 or idx >= len(lines):
+        raise IndexError("Ligne hors limites — relancez un scan")
+
+    found = find_enclosing_smali_method(lines, idx)
+    if not found:
+        raise ValueError("Impossible de repérer la méthode englobante — relancez un scan")
+    start, end, ret_type = found
+
+    if ret_type != "V":
+        raise ValueError(
+            "Cette méthode retourne une valeur (pas void) : la désactiver automatiquement "
+            "risquerait de casser le build. Utilise plutôt \"Supprimer\" pour vider le texte, "
+            "ou modifie-la manuellement dans l'éditeur."
+        )
+
+    # Déjà désactivée ? (idempotent, évite les doublons si l'action est cliquée 2x)
+    body_start = start + 1
+    for i in range(body_start, end):
+        if lines[i].strip() == "return-void":
+            return {"alreadyDisabled": True, "file": rel, "methodLine": start + 1}
+        if lines[i].strip() and not (_RE_LOCALS_OR_REGISTERS.match(lines[i]) or lines[i].strip().startswith(".param") or lines[i].strip().startswith(".annotation") or lines[i].strip().startswith(".end annotation")):
+            break
+
+    # Insère "return-void" juste après la directive .locals/.registers
+    # (obligatoire en tout premier dans le corps d'une méthode smali).
+    insert_at = body_start
+    for i in range(body_start, end):
+        if _RE_LOCALS_OR_REGISTERS.match(lines[i]):
+            insert_at = i + 1
+            break
+    indent = "    "
+    lines.insert(insert_at, f"{indent}return-void")
+    target.write_text("\n".join(lines), encoding="utf-8")
+    method_sig = lines[start].strip()
+    return {"alreadyDisabled": False, "file": rel, "methodLine": start + 1, "method": method_sig}
+
+
+# =============================================================
+# MODE PROFONDEUR — bouton dev "Désactiver TOUTES les popups en dur"
+# =============================================================
+# Contrairement à disable_ui_fact_block (une popup ciblée à la fois), ceci
+# scanne TOUT le projet smali pour repérer chaque méthode qui affiche un
+# dialogue/popup codé en dur (AlertDialog, Dialog, DialogFragment,
+# PopupWindow...) et neutralise chacune d'un coup — même mécanisme sûr :
+# injection d'un "return-void" en tête de méthode, uniquement si la méthode
+# est void, jamais de suppression de ligne. Une méthode déjà neutralisée
+# ou non-void est simplement listée à part (revue manuelle), jamais devinée.
+_RE_POPUP_SHOW_CALL = re.compile(
+    r'invoke-\w+\s+\{[^}]*\},\s*L[\w/$]*(?:Dialog|PopupWindow)[\w/$]*;->show\w*\('
+)
+
+def scan_popup_show_methods(sid):
+    """Repère, dans tout le projet, chaque méthode smali qui contient au
+    moins un appel show()/showNow()/showAsDropDown() sur un Dialog/
+    AlertDialog/DialogFragment/PopupWindow. Une méthode par entrée (dédupe
+    si plusieurs appels dans la même méthode)."""
+    sdir_v3 = source_dir(sid)
+    sdir_v2 = session_dir(sid) / "decompiled"
+    sdir = sdir_v3 if sdir_v3.exists() else sdir_v2
+    found = []
+    seen = set()
+    if not sdir.exists():
+        return found
+    for f in sorted(sdir.rglob("*.smali")):
+        try:
+            text = f.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        if "show" not in text:
+            continue  # évite de re-splitter en lignes les fichiers sans intérêt
+        rel = str(f.relative_to(sdir)).replace("\\", "/")
+        lines = text.split("\n")
+        for i, line in enumerate(lines):
+            if not _RE_POPUP_SHOW_CALL.search(line):
+                continue
+            enclosing = find_enclosing_smali_method(lines, i)
+            if not enclosing:
+                continue
+            start, end, ret_type = enclosing
+            key = (rel, start)
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append({"file": rel, "callLine": i + 1, "methodStart": start,
+                          "methodEnd": end, "retType": ret_type,
+                          "method": lines[start].strip()})
+    return found
+
+_RE_LOCALS_DIRECTIVE = re.compile(r'^(\s*)\.locals\s+(\d+)\s*$')
+_RE_REGISTERS_DIRECTIVE = re.compile(r'^(\s*)\.registers\s+(\d+)\s*$')
+
+def _return_stub_for_type(ret_type, reg="v0"):
+    """Construit les instructions smali d'un retour "par défaut" correct
+    pour un type de retour donné. Un simple 'return-void' inséré dans une
+    méthode déclarée non-void est rejeté par le vérifieur Dalvik (crash au
+    lancement) : il faut un 'return'/'return-wide'/'return-object' avec la
+    bonne valeur par défaut (0 / false / null)."""
+    if ret_type == "V":
+        return ["return-void"]
+    if ret_type in ("J", "D"):
+        return [f"const-wide/16 {reg}, 0x0", f"return-wide {reg}"]
+    if ret_type in ("Z", "B", "S", "C", "I", "F"):
+        return [f"const/4 {reg}, 0x0", f"return {reg}"]
+    # Type objet (Lpkg/Class;) ou tableau ([...) : on retourne null.
+    return [f"const/4 {reg}, 0x0", f"return-object {reg}"]
+
+def disable_all_popup_methods(sid, force=False):
+    """Neutralise chaque méthode repérée par scan_popup_show_methods.
+
+    - Méthode void, pas déjà désactivée -> 'disabled' ('return-void' en
+      tête, comportement historique inchangé).
+    - Méthode déjà neutralisée -> 'already_disabled'.
+    - Méthode non-void :
+        - force=False (par défaut) -> 'skipped_nonvoid', listée à part
+          pour revue manuelle, rien n'est touché (comportement historique).
+        - force=True -> on tente un retour par défaut du bon type
+          ('disabled_forced'), en augmentant '.locals' d'une unité si
+          besoin pour disposer d'un registre local. Seul le cas '.locals'
+          est géré : une méthode en '.registers' (registres bruts, params
+          compris) est trop risquée à recalculer ici et reste
+          'skipped_nonvoid' même avec force=True.
+
+    Chaque décision (désactivée / déjà désactivée / ignorée / forcée /
+    erreur) est à la fois renvoyée dans `results` et loguée côté serveur
+    (print, visible dans les logs du process) pour audit.
+
+    Traite les méthodes d'un même fichier du bas vers le haut pour que les
+    numéros de ligne déjà calculés restent valides après chaque insertion."""
+    methods = scan_popup_show_methods(sid)
+    by_file = {}
+    for m in methods:
+        by_file.setdefault(m["file"], []).append(m)
+
+    results = []
+    for rel, ms in by_file.items():
+        _, target = _safe_target(sid, rel)
+        if not target.is_file():
+            for m in ms:
+                results.append({"file": rel, "method": m["method"], "status": "error", "error": "Fichier introuvable"})
+                print(f"[popups] ERREUR {rel} :: {m['method']} -> fichier introuvable")
+            continue
+        lines = target.read_text(encoding="utf-8").split("\n")
+        changed = False
+        # Du bas vers le haut : une insertion plus bas ne décale jamais les
+        # méthodes situées au-dessus, donc pas besoin de recalculer.
+        for m in sorted(ms, key=lambda x: -x["methodStart"]):
+            start, end, ret_type = m["methodStart"], m["methodEnd"], m["retType"]
+            if start >= len(lines) or end >= len(lines) or not _RE_METHOD_START.match(lines[start]):
+                results.append({"file": rel, "method": m["method"], "status": "error", "error": "Le fichier a changé — relancez le scan"})
+                print(f"[popups] ERREUR {rel} :: {m['method']} -> fichier modifié depuis le scan")
+                continue
+
+            body_start = start + 1
+            already = any(lines[i].strip() == "return-void" for i in range(body_start, min(body_start + 3, end)))
+            if already:
+                results.append({"file": rel, "method": m["method"], "status": "already_disabled"})
+                print(f"[popups] DEJA DESACTIVEE {rel}:{start+1} :: {m['method']}")
+                continue
+
+            if ret_type != "V":
+                if not force:
+                    results.append({"file": rel, "method": m["method"], "status": "skipped_nonvoid", "retType": ret_type})
+                    print(f"[popups] IGNOREE (non-void, retour={ret_type}) {rel}:{start+1} :: {m['method']}")
+                    continue
+                # force=True : on ne gère que le cas '.locals'. '.registers'
+                # mélange params+locaux et est trop risqué à recalculer ici.
+                locals_idx, locals_n = None, None
+                for i in range(body_start, end):
+                    lm = _RE_LOCALS_DIRECTIVE.match(lines[i])
+                    if lm:
+                        locals_idx, locals_n = i, int(lm.group(2))
+                        break
+                    if _RE_REGISTERS_DIRECTIVE.match(lines[i]):
+                        break
+                if locals_idx is None:
+                    results.append({"file": rel, "method": m["method"], "status": "skipped_nonvoid", "retType": ret_type,
+                                     "error": "force impossible (méthode en .registers, pas .locals)"})
+                    print(f"[popups] IGNOREE MEME AVEC FORCE (.registers, retour={ret_type}) {rel}:{start+1} :: {m['method']}")
+                    continue
+                if locals_n < 1:
+                    lines[locals_idx] = re.sub(r'\.locals\s+\d+', '.locals 1', lines[locals_idx])
+                stub = _return_stub_for_type(ret_type, "v0")
+                insert_at = locals_idx + 1
+                for j, instr in enumerate(stub):
+                    lines.insert(insert_at + j, f"    {instr}")
+                changed = True
+                results.append({"file": rel, "method": m["method"], "methodLine": start + 1, "status": "disabled_forced", "retType": ret_type})
+                print(f"[popups] DESACTIVEE (FORCEE, retour={ret_type} -> valeur par défaut) {rel}:{start+1} :: {m['method']}")
+                continue
+
+            insert_at = body_start
+            for i in range(body_start, end):
+                if _RE_LOCALS_OR_REGISTERS.match(lines[i]):
+                    insert_at = i + 1
+                    break
+            lines.insert(insert_at, "    return-void")
+            changed = True
+            results.append({"file": rel, "method": m["method"], "methodLine": start + 1, "status": "disabled"})
+            print(f"[popups] DESACTIVEE {rel}:{start+1} :: {m['method']}")
+        if changed:
+            target.write_text("\n".join(lines), encoding="utf-8")
+    return results
+
+
+# =============================================================
+# MODE PROFONDEUR — vue visuelle de TOUT le texte/boutons affichés
+# =============================================================
+# Contrairement à scan_smali_facts (constantes brutes dans le bytecode),
+# ce scan couvre les deux autres sources de texte affiché à l'écran :
+#   - res/values*/strings.xml   → tout le texte "officiel" de l'app
+#   - res/layout*/*.xml         → les libellés écrits en dur directement
+#     dans un layout (android:text="...") sur un bouton/label/champ, sans
+#     passer par strings.xml
+# Chaque item est identifiable et modifiable individuellement, et le
+# fichier n'est jamais réécrit intégralement : seule la ligne concernée
+# est remplacée, pour ne jamais risquer de casser le XML autour.
+
+_RE_STRING_ENTRY = re.compile(r'<string\s+name="([^"]+)"([^>]*)>(.*?)</string>', re.S)
+_RE_LAYOUT_TEXT_ATTR = re.compile(r'android:text\s*=\s*"([^"]*)"')
+_RE_LAYOUT_TAG_OPEN = re.compile(r'<([A-Za-z][\w.]*)\b')
+
+# Un APK décompilé fusionne dans un SEUL res/values/strings.xml des milliers
+# d'entrées venant des bibliothèques (Material Components, AppCompat, Google
+# Play Services, ExoPlayer...) en plus des vraies chaînes de l'app. Sans
+# filtre, ces entrées de bibliothèque (souvent 1000+) remplissent le budget
+# max_facts et noient les textes propres à l'app (dont un éventuel bandeau
+# "Important Notice" / watermark injecté par le build) qui n'apparaissent
+# alors JAMAIS dans le Mode Profondeur. On exclut donc par préfixe de nom
+# les familles connues de bibliothèques — ce qui laisse remonter en
+# priorité les chaînes réellement propres à l'app.
+_LIBRARY_STRING_NAME_PREFIXES = (
+    "mtrl_", "m3_", "m3c_", "abc_", "androidx_", "common_google_",
+    "firebase_", "exo_", "cast_", "gcm_", "status_bar_", "search_menu_",
+    "bottom_sheet_", "character_counter_", "clear_text_", "error_icon_",
+    "hide_bottom_view_on_scroll_", "icon_content_description", "item_view_role_description",
+    "password_toggle_", "path_password_", "appbar_scrolling_view_behavior",
+)
+
+def _is_library_string_name(name):
+    return any(name.startswith(p) for p in _LIBRARY_STRING_NAME_PREFIXES)
+
+# Tags Android correspondant à un "bouton" au sens large, pour affichage
+# groupé côté client (icône différente, filtre "Boutons" à part).
+_BUTTON_TAGS = {"Button", "ImageButton", "ToggleButton", "Switch", "RadioButton",
+                "CheckBox", "FloatingActionButton", "MaterialButton",
+                "AppCompatButton", "AppCompatImageButton"}
+
+def _ui_values_dirs(sdir):
+    res = sdir / "res"
+    if not res.exists():
+        return []
+    return sorted(res.glob("values*"))
+
+def scan_string_res_facts(sid, max_facts=1500):
+    """Scanne res/values*/strings.xml : un fact par <string name=...>...</string>."""
+    sdir_v3 = source_dir(sid)
+    sdir_v2 = session_dir(sid) / "decompiled"
+    sdir = sdir_v3 if sdir_v3.exists() else sdir_v2
+    facts = []
+    if not sdir.exists():
+        return facts
+    for vd in _ui_values_dirs(sdir):
+        f = vd / "strings.xml"
+        if not f.exists() or len(facts) >= max_facts:
+            continue
+        try:
+            text = f.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        rel = str(f.relative_to(sdir)).replace("\\", "/")
+        for m in _RE_STRING_ENTRY.finditer(text):
+            if len(facts) >= max_facts:
+                break
+            name, attrs, raw_val = m.groups()
+            if _is_library_string_name(name):
+                continue  # bruit de bibliothèque (Material/AppCompat/...) : jamais du contenu de l'app
+            # Retire les balises de mise en forme (<b>, <i>...) pour l'affichage,
+            # mais on réécrit toujours le contenu BRUT tel quel à l'application.
+            display_val = re.sub(r'</?[a-zA-Z][^>]*>', '', raw_val).strip()
+            facts.append({
+                "id": f"strres::{rel}::{name}",
+                "type": "string_res",
+                "label": "Texte (strings.xml)",
+                "group": name,
+                "file": rel,
+                "value": display_val,
+                "translatable": ('translatable="false"' not in attrs),
+            })
+    return facts
+
+def scan_layout_text_facts(sid, max_facts=1500):
+    """Scanne res/layout*/*.xml : un fact par android:text="litéral" (pas
+    @string/xxx, déjà couvert par scan_string_res_facts), avec le tag de
+    l'élément (Button, TextView, EditText...) pour grouper visuellement
+    par type côté client."""
+    sdir_v3 = source_dir(sid)
+    sdir_v2 = session_dir(sid) / "decompiled"
+    sdir = sdir_v3 if sdir_v3.exists() else sdir_v2
+    facts = []
+    if not sdir.exists():
+        return facts
+    res = sdir / "res"
+    if not res.exists():
+        return facts
+    layout_dirs = sorted(res.glob("layout*"))
+    for ld in layout_dirs:
+        if not ld.is_dir():
+            continue
+        for f in sorted(ld.glob("*.xml")):
+            if len(facts) >= max_facts:
+                break
+            try:
+                text = f.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError):
+                continue
+            rel = str(f.relative_to(sdir)).replace("\\", "/")
+            lines = text.split("\n")
+            # Pour retrouver le tag Android (Button/TextView/...) de l'élément
+            # qui contient chaque android:text, on remonte depuis la ligne du
+            # match jusqu'à la dernière balise ouvrante rencontrée au-dessus.
+            for i, line in enumerate(lines):
+                if len(facts) >= max_facts:
+                    break
+                m = _RE_LAYOUT_TEXT_ATTR.search(line)
+                if not m:
+                    continue
+                val = m.group(1)
+                if val.startswith("@string/") or val.startswith("@android:string/") or not val.strip():
+                    continue  # référence ou vide : rien à éditer ici
+                tag = "Vue"
+                for j in range(i, -1, -1):
+                    tm = _RE_LAYOUT_TAG_OPEN.search(lines[j])
+                    if tm:
+                        tag = tm.group(1).split(".")[-1]
+                        break
+                facts.append({
+                    "id": f"layout::{rel}::{i + 1}",
+                    "type": "layout_button" if tag in _BUTTON_TAGS else "layout_text",
+                    "label": f"{'Bouton' if tag in _BUTTON_TAGS else 'Texte'} ({tag})",
+                    "group": tag,
+                    "file": rel,
+                    "line": i + 1,
+                    "value": val,
+                })
+    return facts
+
+def scan_ui_facts(sid, max_facts=2500):
+    """Combine strings.xml + layouts + textes smali bruts en une seule liste,
+    pour le panneau "Mode Profondeur" : TOUT le texte/boutons affichés dans
+    l'APK, visuellement, modifiable ou supprimable sans casser le build.
+
+    Ordre volontaire : smali puis layouts D'ABORD, strings.xml en dernier.
+    Raison : strings.xml d'un APK décompilé peut contenir des milliers
+    d'entrées de bibliothèque (déjà filtrées par nom quand reconnues, mais
+    des variantes inconnues peuvent rester) alors que le texte propre à
+    l'app (dont un éventuel bandeau/watermark injecté au build) vit presque
+    toujours dans le smali ou les layouts de l'app. En les scannant en
+    premier, ils ne sont jamais tronqués par le plafond max_facts."""
+    facts = []
+    facts += scan_layout_text_facts(sid, max_facts=max_facts)
+    if len(facts) < max_facts:
+        smali_texts = [f for f in scan_smali_facts(sid, max_facts=max_facts - len(facts)) if f["type"] == "text"]
+        facts += smali_texts
+    if len(facts) < max_facts:
+        facts += scan_string_res_facts(sid, max_facts=max_facts - len(facts))
+    return facts[:max_facts]
+
+def apply_ui_fact(sid, fact_id, new_value):
+    """Applique l'édition d'un fact du Mode Profondeur. Dispatch selon le
+    préfixe de l'id vers la bonne stratégie d'écriture (strings.xml,
+    layout XML, ou smali — réutilise apply_smali_fact pour ce dernier)."""
+    if fact_id.startswith("strres::"):
+        _, rel, name = fact_id.split("::", 2)
+        _, target = _safe_target(sid, rel)
+        if not target.is_file():
+            raise FileNotFoundError("Fichier strings.xml introuvable — relancez un scan")
+        text = target.read_text(encoding="utf-8")
+        def _repl(m):
+            nm, attrs, _old = m.groups()
+            if nm != name:
+                return m.group(0)
+            esc_val = (new_value.replace("&", "&amp;").replace("<", "&lt;")
+                       .replace(">", "&gt;").replace("'", "\\'"))
+            return f'<string name="{nm}"{attrs}>{esc_val}</string>'
+        new_text, n = _RE_STRING_ENTRY.subn(_repl, text)
+        if n == 0 or name not in text:
+            raise ValueError(f"Entrée '{name}' introuvable dans {rel} — relancez un scan")
+        target.write_text(new_text, encoding="utf-8")
+        return
+    if fact_id.startswith("layout::"):
+        _, rel, lineno_s = fact_id.split("::", 2)
+        lineno = int(lineno_s)
+        _, target = _safe_target(sid, rel)
+        if not target.is_file():
+            raise FileNotFoundError("Fichier layout introuvable — relancez un scan")
+        lines = target.read_text(encoding="utf-8").split("\n")
+        idx = lineno - 1
+        if idx < 0 or idx >= len(lines):
+            raise IndexError("Ligne hors limites — relancez un scan")
+        esc_val = (new_value.replace("&", "&amp;").replace("<", "&lt;")
+                   .replace(">", "&gt;").replace('"', "&quot;"))
+        new_line, n = _RE_LAYOUT_TEXT_ATTR.subn(f'android:text="{esc_val}"', lines[idx], count=1)
+        if n == 0:
+            raise ValueError("android:text introuvable sur cette ligne — relancez un scan")
+        lines[idx] = new_line
+        target.write_text("\n".join(lines), encoding="utf-8")
+        return
+    # Sinon : fact de type smali (const-string texte), même mécanisme que
+    # l'onglet Smali Facile.
+    apply_smali_fact(sid, fact_id, new_value)
+
+
+# =============================================================
 # AXML (Android Binary XML) — édition SÛRE du string pool
 # =============================================================
 # Format ResXMLTree (compilé par aapt) : un en-tête racine (type=0x0003),
@@ -1979,6 +3204,33 @@ def rewrite_axml_strings(data: bytes, new_strings: list) -> bytes:
 # =============================================================
 # CRÉATION DU PROJET DE ZÉRO (SANS TEMPLATE)
 # =============================================================
+_SCRATCH_SKELETON_HTML = """<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>App</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app">
+    <h1>Nouvelle app</h1>
+    <p>Remplace ce contenu (assets/index.html, assets/style.css, assets/app.js).</p>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>
+"""
+
+_SCRATCH_SKELETON_CSS = """body { margin: 0; font-family: sans-serif; padding: 16px; }
+#app { max-width: 100%; }
+"""
+
+_SCRATCH_SKELETON_JS = """// app.js — logique de l'app scratch
+console.log("app.js chargé");
+"""
+
+
 def create_scratch_session(config, icon_bytes, splash_bytes, site_zip_bytes, logger):
     """
     Crée un dossier source complet pour apktool b — sans aucun template APK.
@@ -2098,17 +3350,33 @@ def create_scratch_session(config, icon_bytes, splash_bytes, site_zip_bytes, log
     assets_dir = src / "assets"
     assets_dir.mkdir(exist_ok=True)
 
-    if mode == "html" and html_inline:
-        # BUG-m03 — forcer <meta charset="UTF-8"> si absent (un HTML collé depuis Word
-        # peut contenir charset="ISO-8859-1" → caractères cassés dans la WebView)
-        if "<meta charset" not in html_inline.lower() and "<meta http-equiv=\"content-type\"" not in html_inline.lower():
-            html_inline = html_inline.replace(
-                "<head>", '<head>\n<meta charset="UTF-8">', 1
-            ) if "<head>" in html_inline else (
-                '<meta charset="UTF-8">\n' + html_inline
-            )
-        (assets_dir / "index.html").write_text(html_inline, encoding="utf-8")
-        logger.log("✅ assets/index.html injecté")
+    if mode == "html":
+        # SQUELETTE SYSTÉMATIQUE — même si html_inline est vide (cas où l'IA
+        # va écrire index.html/style.css/app.js ensuite via write_file), on
+        # ne laisse JAMAIS assets/ vide : c'est ça qui causait la page
+        # "Contenu manquant" quand la session était créée puis le fichier
+        # jamais/mal écrit avant un build. L'IA sait désormais d'avance que
+        # ces 3 fichiers existent déjà à ces chemins exacts et n'a qu'à les
+        # REMPLACER (write_file), jamais à les créer de zéro.
+        if html_inline:
+            # BUG-m03 — forcer <meta charset="UTF-8"> si absent (un HTML collé depuis Word
+            # peut contenir charset="ISO-8859-1" → caractères cassés dans la WebView)
+            if "<meta charset" not in html_inline.lower() and "<meta http-equiv=\"content-type\"" not in html_inline.lower():
+                html_inline = html_inline.replace(
+                    "<head>", '<head>\n<meta charset="UTF-8">', 1
+                ) if "<head>" in html_inline else (
+                    '<meta charset="UTF-8">\n' + html_inline
+                )
+            (assets_dir / "index.html").write_text(html_inline, encoding="utf-8")
+            logger.log("✅ assets/index.html injecté")
+        else:
+            if not stage_webroot_from_template("scratch", assets_dir, logger):
+                assets_dir.mkdir(parents=True, exist_ok=True)
+                (assets_dir / "index.html").write_text(_SCRATCH_SKELETON_HTML, encoding="utf-8")
+                (assets_dir / "style.css").write_text(_SCRATCH_SKELETON_CSS, encoding="utf-8")
+                (assets_dir / "app.js").write_text(_SCRATCH_SKELETON_JS, encoding="utf-8")
+                logger.log("✅ Squelette scratch écrit (assets/index.html + style.css + app.js) — "
+                            "l'IA doit les REMPLACER via write_file, pas en créer d'autres.")
 
     elif mode == "sitezip" and site_zip_bytes:
         logger.log("🗂 Extraction du site complet (zip)...")
@@ -2155,6 +3423,7 @@ def create_scratch_session(config, icon_bytes, splash_bytes, site_zip_bytes, log
         "origin": "scratch",
     }
     (sdir / "session.json").write_text(json.dumps(meta), encoding="utf-8")
+    enforce_project_entrypoint(sid, kind_hint="", logger=logger)
     logger.log(f"✅ Session créée: {sid}")
     return sid
 
@@ -2162,6 +3431,174 @@ def create_scratch_session(config, icon_bytes, splash_bytes, site_zip_bytes, log
 # =============================================================
 # DÉCOMPILATION (mode Dev — conservé pour APK existants)
 # =============================================================
+def _resolve_string_res(decompiled, ref):
+    """Résout '@string/xxx' en cherchant dans res/values*/strings.xml.
+    Retourne la valeur littérale, ou None si non trouvée / si ce n'était
+    déjà pas une référence @string/."""
+    if not ref or not ref.startswith("@string/"):
+        return ref
+    name = ref.split("/", 1)[1]
+    values_dirs = sorted((decompiled / "res").glob("values*")) if (decompiled / "res").exists() else []
+    for vd in values_dirs:
+        f = vd / "strings.xml"
+        if not f.exists():
+            continue
+        try:
+            txt = f.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        m = re.search(rf'<string name="{re.escape(name)}"[^>]*>(.*?)</string>', txt, re.S)
+        if m:
+            val = m.group(1).strip()
+            val = re.sub(r'</?[a-zA-Z][^>]*>', '', val)  # retire <b>, <i>, etc.
+            return val.replace("\\'", "'").replace("&amp;", "&")
+    return None
+
+
+def extract_apk_identity(decompiled, pkg_old):
+    """Relit un APK décompilé (apktool) pour en extraire l'identité réelle
+    (nom d'app, version, SDK, orientation, permissions, icône, contenu
+    webview) afin de synchroniser tout de suite le panneau de droite
+    (Identité / Contenu / Permissions / Assets / Manifest+) avec ce qui est
+    VRAIMENT dans l'APK importé comme template — au lieu de laisser les
+    valeurs par défaut du formulaire ('MonApp', 'com.example.myapp'...)."""
+    info = {
+        "appName": None, "packageName": pkg_old,
+        "versionName": None, "versionCode": None,
+        "minSdk": None, "targetSdk": None,
+        "orientation": "unspecified",
+        "permissions": [], "customPermissions": "",
+        "iconRelPath": None,
+        "contentMode": "url", "appUrl": "", "htmlContent": "",
+        "fullscreen": False, "immersive": False, "lockTask": False,
+    }
+
+    manifest_path = decompiled / "AndroidManifest.xml"
+    mc = ""
+    if manifest_path.exists():
+        try:
+            mc = manifest_path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            mc = ""
+
+    # ── apktool.yml : version + SDKs (bien plus fiable que le manifest, où
+    # aapt les retire souvent après compilation) ─────────────────────────
+    yml_path = decompiled / "apktool.yml"
+    if yml_path.exists():
+        try:
+            yml = yml_path.read_text(encoding="utf-8", errors="ignore")
+            m = re.search(r"versionCode:\s*'?([0-9]+)'?", yml)
+            if m: info["versionCode"] = m.group(1)
+            m = re.search(r"versionName:\s*'([^']*)'", yml) or re.search(r'versionName:\s*"([^"]*)"', yml)
+            if m: info["versionName"] = m.group(1)
+            m = re.search(r"minSdkVersion:\s*'?([0-9]+)'?", yml)
+            if m: info["minSdk"] = m.group(1)
+            m = re.search(r"targetSdkVersion:\s*'?([0-9]+)'?", yml)
+            if m: info["targetSdk"] = m.group(1)
+        except Exception:
+            pass
+
+    if mc:
+        if not info["versionCode"]:
+            m = re.search(r'android:versionCode="([^"]+)"', mc)
+            if m: info["versionCode"] = m.group(1)
+        if not info["versionName"]:
+            m = re.search(r'android:versionName="([^"]+)"', mc)
+            if m: info["versionName"] = m.group(1)
+        if not info["minSdk"]:
+            m = re.search(r'android:minSdkVersion="([^"]+)"', mc)
+            if m: info["minSdk"] = m.group(1)
+        if not info["targetSdk"]:
+            m = re.search(r'android:targetSdkVersion="([^"]+)"', mc)
+            if m: info["targetSdk"] = m.group(1)
+
+        # ── Nom de l'app : android:label sur <application>, résolu si
+        # c'est une référence @string/... ────────────────────────────
+        m = re.search(r'<application\b[^>]*android:label="([^"]+)"', mc)
+        if m:
+            label = m.group(1)
+            resolved = _resolve_string_res(decompiled, label) if label.startswith("@string/") else label
+            info["appName"] = resolved or label
+
+        # ── Orientation : première activité avec un LAUNCHER intent-filter,
+        # sinon la première activité tout court ────────────────────────
+        launcher_block = re.search(
+            r'<activity\b[^>]*>(?:(?!</activity>).)*?android\.intent\.category\.LAUNCHER.*?</activity>', mc, re.S)
+        block = launcher_block.group(0) if launcher_block else mc
+        m = re.search(r'android:screenOrientation="([^"]+)"', block)
+        if m: info["orientation"] = m.group(1)
+
+        # ── Permissions ─────────────────────────────────────────────────
+        info["permissions"] = sorted(set(re.findall(r'<uses-permission[^>]*android:name="([^"]+)"', mc)))
+
+        # ── Flags d'affichage (best-effort, dépend de FLAG_FULLSCREEN /
+        # thème NoActionBar déjà injectés côté smali/manifest) ─────────
+        if "FLAG_FULLSCREEN" in mc or 'android:theme="@android:style/Theme.NoTitleBar.Fullscreen"' in mc:
+            info["fullscreen"] = True
+
+    if not info["appName"]:
+        info["appName"] = pkg_old.rsplit(".", 1)[-1].capitalize() if pkg_old else "MonApp"
+
+    # ── Icône : cherche ic_launcher dans le mipmap/drawable de plus haute
+    # densité disponible, pour prévisualisation immédiate côté client ──
+    res_dir = decompiled / "res"
+    if res_dir.exists():
+        density_order = ["xxxhdpi", "xxhdpi", "xhdpi", "hdpi", "mdpi", "anydpi-v26", ""]
+        icon_names = ["ic_launcher.png", "ic_launcher_round.png", "icon.png"]
+        found = None
+        for density in density_order:
+            for prefix in ("mipmap", "drawable"):
+                folder = res_dir / (f"{prefix}-{density}" if density else prefix)
+                if not folder.exists():
+                    continue
+                for name in icon_names:
+                    cand = folder / name
+                    if cand.exists():
+                        found = cand
+                        break
+                if found:
+                    break
+            if found:
+                break
+        if found:
+            info["iconRelPath"] = str(found.relative_to(decompiled)).replace("\\", "/")
+
+    # ── Contenu WebView : si assets/index.html existe déjà dans le
+    # template, on bascule le panneau Contenu en mode HTML et on
+    # préremplit avec le vrai contenu trouvé ───────────────────────────
+    index_candidates = [decompiled / "assets" / "index.html", decompiled / "assets" / "www" / "index.html"]
+    found_html = False
+    for idx in index_candidates:
+        if idx.exists():
+            try:
+                info["contentMode"] = "html"
+                info["htmlContent"] = idx.read_text(encoding="utf-8", errors="ignore")[:200_000]
+                found_html = True
+            except Exception:
+                pass
+            break
+    if not found_html:
+        # Pas de HTML embarqué : cherche une URL codée en dur (loadUrl) dans
+        # le smali, sinon laisse le mode URL vide (l'utilisateur la renseigne).
+        try:
+            for smali_dir in decompiled.glob("smali*"):
+                for f in smali_dir.rglob("*.smali"):
+                    try:
+                        txt = f.read_text(encoding="utf-8", errors="ignore")
+                    except Exception:
+                        continue
+                    m = re.search(r'const-string[^"]*"(https?://[^"]+)"', txt)
+                    if m:
+                        info["appUrl"] = m.group(1)
+                        break
+                if info["appUrl"]:
+                    break
+        except Exception:
+            pass
+
+    return info
+
+
 def decompile_to_session(template_bytes, logger):
     sid = new_session_id()
     sd  = session_dir(sid)
@@ -2214,14 +3651,23 @@ def decompile_to_session(template_bytes, logger):
         m  = re.search(r'package="([^"]+)"', mc)
         if m: pkg_old = m.group(1)
 
+    logger.log("🔎 Extraction de l'identité réelle de l'APK (nom, version, permissions, icône, contenu)...")
+    try:
+        identity = extract_apk_identity(decompiled, pkg_old)
+    except Exception as e:
+        logger.log(f"⚠ Extraction identité partielle/échouée : {e}")
+        identity = {"appName": pkg_old.rsplit(".", 1)[-1].capitalize() if pkg_old else "MonApp"}
+
     meta = {
         "created": time.time(),
         "package": pkg_old,
         "packageOld": pkg_old,
         "origin": "decompile",
+        "appName": identity.get("appName"),
+        "identity": identity,
     }
     (sd / "session.json").write_text(json.dumps(meta), encoding="utf-8")
-    logger.log(f"✅ Session prête: {sid} (package: {pkg_old})")
+    logger.log(f"✅ Session prête: {sid} (package: {pkg_old}, app: {identity.get('appName')})")
     return sid, pkg_old
 
 
@@ -2973,6 +4419,7 @@ def _recompile_hybrid_session(sid, origin, signing, out_name, logger):
     aussi sur ces sessions (avant, il tentait apktool sur un dossier
     'source'/'decompiled' qui n'existe pas pour ces origines et échouait)."""
     logger.log(f"♻ Session hybride détectée (origin={origin}) — pipeline dédié (pas apktool).")
+    _assert_entrypoint_ready(sid, origin, logger)
 
     if origin == "cordova":
         proj = cordova_project_dir(sid)
@@ -3027,6 +4474,7 @@ def recompile_session(sid, signing, out_name, logger):
     sdir_v3 = source_dir(sid)
     sdir_v2 = sd / "decompiled"
     src = sdir_v3 if sdir_v3.exists() else sdir_v2
+    _assert_entrypoint_ready(sid, "", logger)
 
     java    = find_tool("java")
     apktool = find_tool("apktool")
@@ -3216,15 +4664,57 @@ def _verify_signature_schemes(apksigner, apk_path, logger):
 # KEYSTORE PYTHON PUR
 # =============================================================
 def _ensure_cryptography(logger):
+    """Fallback de dernier recours (utilisé seulement si AUCUN keytool n'a
+    été trouvé — voir _candidates()/find_tool ci-dessus, désormais capable
+    de détecter tools/jdk/bin/keytool.exe). Sur les machines clientes sans
+    connexion internet pour ce Python embarqué, 'pip install' échouera de
+    toute façon : on tente donc plusieurs approches et on remonte le VRAI
+    message d'erreur de pip (au lieu de l'exception générique) pour que le
+    diagnostic soit exploitable."""
     try:
         import cryptography; return True
     except ImportError:
-        logger.log("📦 Installation de 'cryptography'...")
+        pass
+
+    logger.log("📦 'cryptography' absent — tentative d'installation (fallback, keytool du JDK non trouvé)...")
+    attempts = [
+        [sys.executable, "-m", "pip", "install", "cryptography"],
+        [sys.executable, "-m", "pip", "install", "--user", "cryptography"],
+        [sys.executable, "-m", "pip", "install", "--no-cache-dir", "cryptography"],
+    ]
+    last_stderr = ""
+    for cmd in attempts:
         try:
-            subprocess.run([sys.executable, "-m", "pip", "install", "cryptography", "--quiet"], check=True)
-            logger.log("✅ cryptography installée"); return True
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            if r.returncode == 0:
+                logger.log("✅ cryptography installée")
+                return True
+            last_stderr = (r.stderr or r.stdout or "").strip()[-800:]
         except Exception as e:
-            logger.log(f"❌ Impossible d'installer cryptography: {e}"); return False
+            last_stderr = str(e)
+
+    logger.log(f"❌ Impossible d'installer cryptography (pip) : {last_stderr}")
+    logger.log("💡 Cause probable : pas de JDK détecté (donc pas de keytool) ET pas "
+               "d'accès internet pip sur cette machine. Solution recommandée : installe "
+               "le composant 'jdk' depuis l'onglet Composants — le keytool du JDK "
+               "permet de générer le keystore SANS dépendre de pip/internet.")
+    return False
+
+def _find_custom_keystore():
+    """Retourne le nom du 1er fichier .keystore/.jks trouvé dans TOOLS_DIR
+    (hors debug.keystore) — corrige le bug où /check ne détectait QUE le
+    nom par défaut 'mon.keystore', donc perdait le bouton "Régénérer" dès
+    que le client avait choisi un autre nom de fichier keystore."""
+    try:
+        for f in TOOLS_DIR.glob("*.keystore"):
+            if f.name != "debug.keystore":
+                return f.name
+        for f in TOOLS_DIR.glob("*.jks"):
+            return f.name
+    except Exception:
+        pass
+    return None
+
 
 def create_keystore_python(ks_path, alias, store_pass, key_pass, dname_str, validity_days, logger):
     if not _ensure_cryptography(logger): return False
@@ -3408,6 +4898,43 @@ NATIVE_KOTLIN_VERSION      = "1.9.23"
 def native_project_dir(sid):
     return WORK_DIR / sid / "native_project"
 
+def stage_native_skeleton(kotlin_dir: Path, res_dir: Path, package: str, logger=None):
+    """
+    Équivalent de stage_webroot_from_template mais pour le mode natif
+    (Kotlin/Java) : copie templates/native/kotlin/MainActivity.kt.tmpl
+    (avec substitution __PACKAGE__ → le vrai package) + templates/native/res/
+    (layout/activity_main.xml, values/themes.xml) dans le projet Gradle
+    généré. Retourne True si la copie a eu lieu, False si le dossier-modèle
+    est introuvable (l'appelant garde alors son ancien fallback codé en dur).
+    """
+    src = TEMPLATES_DIR / "native"
+    kt_tmpl = src / "kotlin" / "MainActivity.kt.tmpl"
+    if not kt_tmpl.is_file():
+        if logger:
+            logger.log(f"⚠ Dossier-modèle 'native' introuvable ({src}) — "
+                        f"fallback sur le squelette généré en mémoire.")
+        return False
+
+    kotlin_dir.mkdir(parents=True, exist_ok=True)
+    activity_kt = kt_tmpl.read_text(encoding="utf-8").replace("__PACKAGE__", package)
+    (kotlin_dir / "MainActivity.kt").write_text(activity_kt, encoding="utf-8")
+
+    layout_src = src / "res" / "layout" / "activity_main.xml"
+    if layout_src.is_file():
+        (res_dir / "layout").mkdir(parents=True, exist_ok=True)
+        shutil.copy(layout_src, res_dir / "layout" / "activity_main.xml")
+
+    themes_src = src / "res" / "values" / "themes.xml"
+    if themes_src.is_file():
+        (res_dir / "values").mkdir(parents=True, exist_ok=True)
+        shutil.copy(themes_src, res_dir / "values" / "themes.xml")
+
+    if logger:
+        logger.log("✅ Espace de travail 'native' initialisé depuis templates/native/ "
+                    "(MainActivity.kt + activity_main.xml + themes.xml déjà prêts)")
+    return True
+
+
 def generate_native_project(sid, config, logger):
     """
     Génère un projet Gradle Android minimal et réellement compilable
@@ -3533,34 +5060,43 @@ def generate_native_project(sid, config, logger):
         encoding="utf-8"
     )
 
-    (kotlin_dir / "MainActivity.kt").write_text(
-        f'package {package}\n\n'
-        'import android.os.Bundle\n'
-        'import androidx.appcompat.app.AppCompatActivity\n\n'
-        'class MainActivity : AppCompatActivity() {\n'
-        '    override fun onCreate(savedInstanceState: Bundle?) {\n'
-        '        super.onCreate(savedInstanceState)\n'
-        '        setContentView(R.layout.activity_main)\n'
-        '    }\n'
-        '}\n',
-        encoding="utf-8"
-    )
+    if not stage_native_skeleton(kotlin_dir, res_dir, package, logger):
+        (kotlin_dir / "MainActivity.kt").write_text(
+            f'package {package}\n\n'
+            'import android.os.Bundle\n'
+            'import androidx.appcompat.app.AppCompatActivity\n\n'
+            'class MainActivity : AppCompatActivity() {\n'
+            '    override fun onCreate(savedInstanceState: Bundle?) {\n'
+            '        super.onCreate(savedInstanceState)\n'
+            '        setContentView(R.layout.activity_main)\n'
+            '    }\n'
+            '}\n',
+            encoding="utf-8"
+        )
 
-    (res_dir / "layout" / "activity_main.xml").write_text(
-        '<?xml version="1.0" encoding="utf-8"?>\n'
-        '<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"\n'
-        '    android:layout_width="match_parent"\n'
-        '    android:layout_height="match_parent"\n'
-        '    android:orientation="vertical"\n'
-        '    android:gravity="center">\n'
-        '    <TextView\n'
-        '        android:layout_width="wrap_content"\n'
-        '        android:layout_height="wrap_content"\n'
-        '        android:textSize="20sp"\n'
-        '        android:text="@string/app_name" />\n'
-        '</LinearLayout>\n',
-        encoding="utf-8"
-    )
+        (res_dir / "layout" / "activity_main.xml").write_text(
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"\n'
+            '    android:layout_width="match_parent"\n'
+            '    android:layout_height="match_parent"\n'
+            '    android:orientation="vertical"\n'
+            '    android:gravity="center">\n'
+            '    <TextView\n'
+            '        android:layout_width="wrap_content"\n'
+            '        android:layout_height="wrap_content"\n'
+            '        android:textSize="20sp"\n'
+            '        android:text="@string/app_name" />\n'
+            '</LinearLayout>\n',
+            encoding="utf-8"
+        )
+
+        (res_dir / "values" / "themes.xml").write_text(
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            '<resources>\n'
+            '    <style name="Theme.Native" parent="Theme.MaterialComponents.DayNight.NoActionBar" />\n'
+            '</resources>\n',
+            encoding="utf-8"
+        )
 
     (res_dir / "values" / "strings.xml").write_text(
         '<?xml version="1.0" encoding="utf-8"?>\n'
@@ -3570,13 +5106,16 @@ def generate_native_project(sid, config, logger):
         encoding="utf-8"
     )
 
-    (res_dir / "values" / "themes.xml").write_text(
-        '<?xml version="1.0" encoding="utf-8"?>\n'
-        '<resources>\n'
-        '    <style name="Theme.Native" parent="Theme.MaterialComponents.DayNight.NoActionBar" />\n'
-        '</resources>\n',
-        encoding="utf-8"
-    )
+    # BUG CORRIGÉ : un second write_text(themes.xml) inconditionnel se
+    # trouvait ici, juste après le bloc `if not stage_native_skeleton(...)`
+    # qui vient déjà d'écrire (ou de laisser en place, selon le cas) le bon
+    # themes.xml. Ce doublon écrasait donc TOUJOURS le fichier — y compris
+    # celui copié depuis templates/native/res/values/themes.xml — avec un
+    # thème codé en dur identique par coïncidence aujourd'hui, mais qui
+    # aurait silencieusement annulé toute personnalisation future de ce
+    # template (couleurs, style parent...) sans aucune erreur ni log pour
+    # le signaler. Supprimé : le bloc if/else ci-dessus gère déjà themes.xml
+    # correctement dans les deux cas (template présent ou fallback).
 
     # Icônes : PNG classiques (pas d'adaptive-icon XML pour rester simple),
     # réutilise make_icon_png déjà utilisé par le pipeline WebView.
@@ -3821,14 +5360,31 @@ def do_build_native(config, icon_bytes):
     interférer avec OPS['legacy'] (pipeline WebView) — les deux peuvent
     même tourner en parallèle sans se marcher dessus.
     """
-    logger = OPS["native"] = OpLogger()
-    logger.lines = []; logger.status = "building"; logger.result_file = None
+    global CURRENT_SESSION
+    logger = OPS["native"]  # déjà réservé (status="building") par try_reserve_op() côté handler HTTP
     sid = new_session_id()
     logger.session = sid
+    # BUG-FIX (root cause) : CURRENT_SESSION n'était mis à jour que par les
+    # endpoints /*-generate (session éditable sans build). Les pipelines de
+    # build direct (natif/TWA/cordova/reactnative/flutter/nativescript/maui/
+    # titanium) créaient une session ici mais ne la propageaient jamais à
+    # CURRENT_SESSION : /tree, /apply, /recompile continuaient donc de
+    # pointer vers l'ancienne session (souvent scratch) au lieu du projet
+    # qu'on vient réellement de construire.
+    CURRENT_SESSION = sid
     try:
         if icon_bytes:
             config["_iconBytes"] = icon_bytes
         proj = generate_native_project(sid, config, logger)
+        # CORRECTIF : sans ceci, un projet natif n'apparaissait jamais dans
+        # /sessions (aucun session.json) — impossible à retrouver dans le
+        # panneau "SESSIONS", à rouvrir plus tard via select_session, ou à
+        # associer à l'onglet "Natif" de l'explorateur comme les autres
+        # types (cordova/flutter/reactnative) le font déjà via
+        # write_hybrid_session_meta. Combiné à l'ajout de "native_project"
+        # dans PROJECT_ROOT_SUBDIRS ci-dessus, le projet natif redevient
+        # listable ET parcourable comme n'importe quel autre type.
+        write_hybrid_session_meta(sid, "native", config)
         build_type = "assembleDebug" if (config.get("signing", {}).get("mode") == "debug") else "assembleRelease"
         unsigned_apk = run_gradle_build(proj, logger, build_type)
 
@@ -4053,10 +5609,12 @@ def do_build_twa(config, icon_bytes):
     publique, pas un upload) — gardé au même endroit d'appel que
     do_build_native pour une intégration symétrique côté /build-twa.
     """
-    logger = OPS["twa"] = OpLogger()
-    logger.lines = []; logger.status = "building"; logger.result_file = None
+    global CURRENT_SESSION
+    logger = OPS["twa"]  # déjà réservé (status="building") par try_reserve_op() côté handler HTTP
     sid = new_session_id()
     logger.session = sid
+    # BUG-FIX (root cause) : voir commentaire équivalent dans do_build_native.
+    CURRENT_SESSION = sid
     try:
         ensure_bubblewrap_config(logger)
         proj = generate_twa_manifest(sid, config, logger)
@@ -4216,8 +5774,7 @@ def generate_cordova_project(sid, config, icon_bytes, splash_bytes, site_zip_byt
 
     url = ""
     if source_mode == "scratch":
-        if not site_zip_bytes:
-            raise RuntimeError("Mode scratch : un zip du site (HTML/CSS/JS) est requis.")
+        pass  # site_zip_bytes optionnel : si absent, fallback sur le dossier-modele cordova (templates/cordova/webroot/)
     else:
         url = (config.get("url") or "").strip()
         if not url or not url.startswith(("http://", "https://")):
@@ -4245,7 +5802,17 @@ def generate_cordova_project(sid, config, icon_bytes, splash_bytes, site_zip_byt
 
     www_dir = proj / "www"
 
-    if source_mode == "scratch":
+    if source_mode == "scratch" and not site_zip_bytes:
+        # Aucun zip fourni : l'IA compte écrire les fichiers ensuite via
+        # write_file — on ne laisse JAMAIS www/ vide, on part du
+        # dossier-modèle Cordova déjà arrangé (templates/cordova/webroot/).
+        if not stage_webroot_from_template("cordova", www_dir, logger):
+            www_dir.mkdir(parents=True, exist_ok=True)
+            (www_dir / "index.html").write_text(_SCRATCH_SKELETON_HTML, encoding="utf-8")
+            (www_dir / "style.css").write_text(_SCRATCH_SKELETON_CSS, encoding="utf-8")
+            (www_dir / "app.js").write_text(_SCRATCH_SKELETON_JS, encoding="utf-8")
+            logger.log("✅ Squelette Cordova écrit (www/index.html + style.css + app.js).")
+    elif source_mode == "scratch":
         # ── Site local zippé : on écrase le www/ par défaut avec le
         # contenu fourni (même logique que le zip "site complet" du mode
         # Scratch classique — extraction sécurisée + remontée d'un niveau
@@ -4306,6 +5873,7 @@ def generate_cordova_project(sid, config, icon_bytes, splash_bytes, site_zip_byt
     if splash_bytes:
         _cordova_write_splash(proj, splash_bytes, logger)
     write_hybrid_session_meta(sid, "cordova", config)
+    enforce_project_entrypoint(sid, kind_hint="cordova", logger=logger)
     return proj
 
 
@@ -4424,6 +5992,7 @@ def generate_cordova_project_from_template(sid, config, icon_bytes, splash_bytes
         raise RuntimeError("Échec de `cordova prepare android` — voir logs ci-dessus.")
 
     write_hybrid_session_meta(sid, "cordova", config)
+    enforce_project_entrypoint(sid, kind_hint="cordova", logger=logger)
     return proj
 
 
@@ -4434,8 +6003,8 @@ def do_generate_cordova_session(config, icon_bytes, splash_bytes=None, site_zip_
     template) et de modifier les fichiers avant de compiler séparément
     via /build-cordova avec {"session": sid}. Token OPS['cordova_gen'].
     """
-    logger = OPS["cordova_gen"] = OpLogger()
-    logger.lines = []; logger.status = "building"; logger.result_file = None
+    global CURRENT_SESSION
+    logger = OPS["cordova_gen"]  # déjà réservé (status="building") par try_reserve_op() côté handler HTTP
     sid = new_session_id()
     logger.session = sid
     try:
@@ -4444,6 +6013,10 @@ def do_generate_cordova_session(config, icon_bytes, splash_bytes=None, site_zip_
             generate_cordova_project_from_template(sid, config, icon_bytes, splash_bytes, project_zip_bytes, logger)
         else:
             generate_cordova_project(sid, config, icon_bytes, splash_bytes, site_zip_bytes, logger)
+        # BUG-FIX : sans ceci, CURRENT_SESSION reste sur l'ancienne session
+        # (scratch ou autre) et /tree, /apply, /recompile continuent
+        # d'afficher/recompiler l'ancien projet au lieu du Cordova généré.
+        CURRENT_SESSION = sid
         logger.log(f"✅ Projet Cordova prêt — session {sid} (modifiable dans l'explorer)")
         logger.status = "done"
     except Exception as e:
@@ -4465,8 +6038,7 @@ def do_build_cordova(config, icon_bytes, splash_bytes=None, site_zip_bytes=None,
     l'explorer), on saute complètement la (re)génération et on compile
     directement le projet existant tel quel.
     """
-    logger = OPS["cordova"] = OpLogger()
-    logger.lines = []; logger.status = "building"; logger.result_file = None
+    logger = OPS["cordova"]  # déjà réservé (status="building") par try_reserve_op() côté handler HTTP
     existing_sid = (config.get("session") or "").strip()
     if existing_sid:
         sid = existing_sid
@@ -4476,6 +6048,7 @@ def do_build_cordova(config, icon_bytes, splash_bytes=None, site_zip_bytes=None,
             if not proj.exists():
                 raise RuntimeError(f"Session {sid} introuvable ou projet Cordova absent — régénère.")
             logger.log(f"♻ Compilation depuis la session existante {sid} (fichiers tels que modifiés)")
+            _assert_entrypoint_ready(sid, "cordova", logger)
             android_dir = proj / "platforms" / "android"
             build_type = "assembleDebug" if (config.get("signing", {}).get("mode") == "debug") else "assembleRelease"
             unsigned_apk = run_gradle_build(android_dir, logger, build_type)
@@ -4495,12 +6068,16 @@ def do_build_cordova(config, icon_bytes, splash_bytes=None, site_zip_bytes=None,
         return
     sid = new_session_id()
     logger.session = sid
+    # BUG-FIX (root cause) : voir commentaire équivalent dans do_build_native.
+    global CURRENT_SESSION
+    CURRENT_SESSION = sid
     try:
         source_mode = (config.get("sourceMode") or "url").strip()
         if source_mode == "template":
             proj = generate_cordova_project_from_template(sid, config, icon_bytes, splash_bytes, project_zip_bytes, logger)
         else:
             proj = generate_cordova_project(sid, config, icon_bytes, splash_bytes, site_zip_bytes, logger)
+        _assert_entrypoint_ready(sid, "cordova", logger)
         android_dir = proj / "platforms" / "android"
         build_type = "assembleDebug" if (config.get("signing", {}).get("mode") == "debug") else "assembleRelease"
         unsigned_apk = run_gradle_build(android_dir, logger, build_type)
@@ -4512,6 +6089,421 @@ def do_build_cordova(config, icon_bytes, splash_bytes=None, site_zip_bytes=None,
         signing = config.get("signing", {"mode": "debug"})
 
         final_apk = sign_native_apk(unsigned_apk, signing, android_dir, out_name, min_sdk, logger)
+        logger.result_file = str(final_apk)
+        logger.status = "done"
+    except Exception as e:
+        import traceback
+        logger.log(f"❌ Erreur: {e}")
+        logger.log(traceback.format_exc())
+        logger.status = "error"
+
+
+# =============================================================
+# PIPELINES BETA — NativeScript / Xamarin.Forms via .NET MAUI / Titanium
+# ---------------------------------------------------------------
+# ⚠ CONTRAIREMENT À CORDOVA/FLUTTER/REACT NATIVE (rodés sur de vraies
+# sessions client), ces 3 pipelines sont neufs et NON VALIDÉS en
+# conditions réelles — aucun environnement de test avec les vrais CLI
+# (ns/dotnet/titanium) n'était disponible au moment de l'écriture.
+# Attends-toi à devoir ajuster ces fonctions après un premier essai réel,
+# en donnant les logs d'erreur exacts. Chacune couvre uniquement le cas
+# "wrapper WebView" (site distant ou site local zippé), pas une vraie app
+# native multi-écrans dans ces frameworks.
+# =============================================================
+
+NATIVESCRIPT_MIN_SDK_DEFAULT = 24
+MAUI_MIN_SDK_DEFAULT = 24
+TITANIUM_MIN_SDK_DEFAULT = 24
+
+_NS_ICON_DENSITIES = {"mdpi": 48, "hdpi": 72, "xhdpi": 96, "xxhdpi": 144, "xxxhdpi": 192}
+
+
+def find_nativescript():
+    bundled = TOOLS_DIR / "nodejs" / ("ns.cmd" if os.name == "nt" else "ns")
+    if bundled.exists():
+        return str(bundled)
+    return shutil.which("ns") or shutil.which("tns")
+
+
+def find_dotnet():
+    bundled = TOOLS_DIR / "dotnet" / ("dotnet.exe" if os.name == "nt" else "dotnet")
+    if bundled.exists():
+        return str(bundled)
+    return shutil.which("dotnet")
+
+
+def find_titanium():
+    bundled = TOOLS_DIR / "nodejs" / ("titanium.cmd" if os.name == "nt" else "titanium")
+    if bundled.exists():
+        return str(bundled)
+    return shutil.which("titanium")
+
+
+def nativescript_project_dir(sid):
+    return WORK_DIR / sid / "nativescript_project"
+
+
+def maui_project_dir(sid):
+    return WORK_DIR / sid / "maui_project"
+
+
+def titanium_project_dir(sid):
+    return WORK_DIR / sid / "titanium_project"
+
+
+def _write_webroot_from_config(webroot, config, site_zip_bytes, logger, index_fallback="<html><body>App</body></html>"):
+    """Commun aux 3 pipelines : mode 'url' → rien à copier (WebView pointera
+    directement vers l'URL) ; mode 'scratch' → dézippe le site fourni dans
+    webroot, avec un index.html minimal de secours si le zip est vide."""
+    webroot.mkdir(parents=True, exist_ok=True)
+    source_mode = (config.get("sourceMode") or "url").strip()
+    if source_mode == "scratch" and site_zip_bytes:
+        with zipfile.ZipFile(io.BytesIO(site_zip_bytes)) as zf:
+            zf.extractall(webroot)
+        if not (webroot / "index.html").exists():
+            (webroot / "index.html").write_text(index_fallback, encoding="utf-8")
+        logger.log(f"✅ Site local extrait dans {webroot}")
+    elif source_mode == "scratch":
+        (webroot / "index.html").write_text(index_fallback, encoding="utf-8")
+        logger.log("⚠ Mode scratch sans site_zip fourni — index.html minimal généré")
+
+
+# ---- NativeScript --------------------------------------------------
+
+def generate_nativescript_project(sid, config, icon_bytes, site_zip_bytes, logger):
+    ns = find_nativescript()
+    if not ns:
+        raise RuntimeError(
+            "NativeScript CLI ('ns') introuvable. Installe le composant "
+            "'nativescript' depuis l'écran des composants avant de générer une app NativeScript."
+        )
+    env = _twa_env(logger)  # JDK + ANDROID_HOME, comme cordova/twa
+
+    app_name = (config.get("appName") or "MonApp").strip()
+    package = normalize_package_name(config.get("packageName"), fallback="com.example.nativescript")
+    proj = nativescript_project_dir(sid)
+    proj.parent.mkdir(parents=True, exist_ok=True)
+
+    logger.log("📦 Création du projet NativeScript (ns create)...")
+    cmd = [ns, "create", proj.name, "--template", "@nativescript/template-blank-ts",
+           "--path", str(proj.parent), "--appid", package]
+    r = subprocess.run(cmd, env=env, capture_output=True, text=True,
+                        encoding="utf-8", errors="replace", timeout=300)
+    for line in (r.stdout or "").strip().split("\n"):
+        if line.strip(): logger.log(line)
+    if r.returncode != 0 or not proj.exists():
+        logger.log("⚠ " + (r.stderr or "")[:500])
+        raise RuntimeError("Échec de `ns create` — voir logs ci-dessus.")
+
+    source_mode = (config.get("sourceMode") or "url").strip()
+    url = (config.get("appUrl") or "").strip()
+    webroot = proj / "app" / "assets" / "www"
+    if source_mode == "scratch":
+        _write_webroot_from_config(webroot, config, site_zip_bytes, logger)
+        webview_src = "~/assets/www/index.html"
+    else:
+        webview_src = url or "https://example.com"
+
+    # Page unique : une WebView plein écran (plugin officiel @nativescript/webview).
+    (proj / "app" / "main-page.xml").write_text(
+        f'<Page xmlns="http://schemas.nativescript.org/tns.xsd">\n'
+        f'  <GridLayout>\n'
+        f'    <WebView src="{webview_src}" />\n'
+        f'  </GridLayout>\n'
+        f'</Page>\n', encoding="utf-8")
+
+    pkg_plugin = subprocess.run([ns, "plugin", "add", "@nativescript/webview"],
+                                cwd=str(proj), env=env, capture_output=True, text=True,
+                                encoding="utf-8", errors="replace", timeout=180)
+    for line in (pkg_plugin.stdout or "").strip().split("\n"):
+        if line.strip(): logger.log(line)
+
+    if icon_bytes:
+        res_dir = proj / "App_Resources" / "Android" / "src" / "main" / "res"
+        for density, size in _NS_ICON_DENSITIES.items():
+            d = res_dir / f"mipmap-{density}"
+            d.mkdir(parents=True, exist_ok=True)
+            png = make_icon_png(icon_bytes, size)
+            (d / "ic_launcher.png").write_bytes(png)
+            (d / "ic_launcher_round.png").write_bytes(png)
+        logger.log("✅ Icônes NativeScript écrites")
+
+    logger.log(f"✅ Projet NativeScript prêt : {proj}")
+    return proj
+
+
+def do_build_nativescript(config, icon_bytes, splash_bytes=None, site_zip_bytes=None):
+    global CURRENT_SESSION
+    logger = OPS["nativescript"]
+    sid = new_session_id()
+    logger.session = sid
+    # BUG-FIX (root cause) : voir commentaire équivalent dans do_build_native.
+    CURRENT_SESSION = sid
+    try:
+        proj = generate_nativescript_project(sid, config, icon_bytes, site_zip_bytes, logger)
+        env = _twa_env(logger)
+        ns = find_nativescript()
+        signing_mode = (config.get("signing") or {}).get("mode", "debug")
+        build_flag = "--release" if signing_mode != "debug" else ""
+        logger.log("🔨 Compilation NativeScript (ns build android)...")
+        cmd = [ns, "build", "android"] + ([build_flag] if build_flag else []) + ["--no-hmr"]
+        r = subprocess.run(cmd, cwd=str(proj), env=env, capture_output=True, text=True,
+                            encoding="utf-8", errors="replace", timeout=1800)
+        for line in (r.stdout or "").strip().split("\n"):
+            if line.strip(): logger.log(line)
+        if r.returncode != 0:
+            logger.log("⚠ " + (r.stderr or "")[:800])
+            raise RuntimeError("Échec de `ns build android` — voir logs ci-dessus.")
+
+        variant = "release" if build_flag else "debug"
+        apk_dir = proj / "platforms" / "android" / "app" / "build" / "outputs" / "apk" / variant
+        candidates = list(apk_dir.glob("*.apk")) if apk_dir.exists() else []
+        if not candidates:
+            raise RuntimeError(f"Build NativeScript terminé mais aucun APK trouvé dans {apk_dir}")
+        unsigned_apk = candidates[0]
+
+        app_name = (config.get("appName") or "MonApp").strip()
+        version_name = str(config.get("versionName") or "1.0")
+        out_name = f"{re.sub(r'[^A-Za-z0-9_.-]', '_', app_name)}_{version_name}_nativescript.apk"
+        min_sdk = config.get("minSdk") or NATIVESCRIPT_MIN_SDK_DEFAULT
+        signing = config.get("signing", {"mode": "debug"})
+        final_apk = sign_native_apk(unsigned_apk, signing, proj, out_name, min_sdk, logger)
+        logger.result_file = str(final_apk)
+        logger.status = "done"
+    except Exception as e:
+        import traceback
+        logger.log(f"❌ Erreur: {e}")
+        logger.log(traceback.format_exc())
+        logger.status = "error"
+
+
+# ---- Xamarin / .NET MAUI -------------------------------------------
+
+def generate_maui_project(sid, config, icon_bytes, site_zip_bytes, logger):
+    dotnet = find_dotnet()
+    if not dotnet:
+        raise RuntimeError(
+            "dotnet introuvable. Installe le composant '.NET SDK + workload maui-android' "
+            "depuis l'écran des composants avant de générer une app MAUI."
+        )
+    app_name = re.sub(r'[^A-Za-z0-9_]', '', (config.get("appName") or "MonApp").strip()) or "MonApp"
+    proj = maui_project_dir(sid)
+    proj.parent.mkdir(parents=True, exist_ok=True)
+
+    logger.log("📦 Création du projet .NET MAUI (dotnet new maui)...")
+    r = subprocess.run([dotnet, "new", "maui", "-n", app_name, "-o", str(proj)],
+                        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
+    for line in (r.stdout or "").strip().split("\n"):
+        if line.strip(): logger.log(line)
+    if r.returncode != 0 or not proj.exists():
+        logger.log("⚠ " + (r.stderr or "")[:500])
+        raise RuntimeError("Échec de `dotnet new maui` — voir logs ci-dessus (workload 'maui-android' installé ?).")
+
+    source_mode = (config.get("sourceMode") or "url").strip()
+    url = (config.get("appUrl") or "").strip()
+
+    if source_mode == "scratch":
+        webroot = proj / "Resources" / "Raw" / "www"
+        _write_webroot_from_config(webroot, config, site_zip_bytes, logger)
+        # Copie les fichiers du site dans le cache local au démarrage, puis
+        # charge le index.html local — un WebView MAUI ne peut pas lire les
+        # assets embarqués (Resources/Raw) par une simple URI relative, il
+        # lui faut un vrai chemin fichier sur disque.
+        mainpage_xaml = (
+            '<?xml version="1.0" encoding="utf-8" ?>\n'
+            '<ContentPage xmlns="http://schemas.microsoft.com/dotnet/2021/maui"\n'
+            '             xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml"\n'
+            '             x:Class="' + app_name + '.MainPage">\n'
+            '    <WebView x:Name="MainWebView" />\n'
+            '</ContentPage>\n')
+        mainpage_cs = (
+            "namespace " + app_name + ";\n\n"
+            "public partial class MainPage : ContentPage\n"
+            "{\n"
+            "    public MainPage()\n"
+            "    {\n"
+            "        InitializeComponent();\n"
+            "        LoadLocalSite();\n"
+            "    }\n\n"
+            "    async void LoadLocalSite()\n"
+            "    {\n"
+            "        var destDir = Path.Combine(FileSystem.CacheDirectory, \"www\");\n"
+            "        Directory.CreateDirectory(destDir);\n"
+            "        using var stream = await FileSystem.OpenAppPackageFileAsync(\"www/index.html\");\n"
+            "        // Copie récursive minimale : seul index.html est garanti ici — les\n"
+            "        // assets liés (css/js) doivent être référencés en relatif et seront\n"
+            "        // eux aussi sous Resources/Raw/www/ embarqués via MauiAsset (voir .csproj).\n"
+            "        using var outFile = File.Create(Path.Combine(destDir, \"index.html\"));\n"
+            "        await stream.CopyToAsync(outFile);\n"
+            "        MainWebView.Source = new UrlWebViewSource { Url = \"file://\" + Path.Combine(destDir, \"index.html\") };\n"
+            "    }\n"
+            "}\n")
+        (proj / "MainPage.xaml").write_text(mainpage_xaml, encoding="utf-8")
+        (proj / "MainPage.xaml.cs").write_text(mainpage_cs, encoding="utf-8")
+        logger.log("✅ MainPage générée (WebView → site local copié en cache au démarrage)")
+    else:
+        mainpage_xaml = (
+            '<?xml version="1.0" encoding="utf-8" ?>\n'
+            '<ContentPage xmlns="http://schemas.microsoft.com/dotnet/2021/maui"\n'
+            '             xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml"\n'
+            '             x:Class="' + app_name + '.MainPage">\n'
+            f'    <WebView Source="{url or "https://example.com"}" />\n'
+            '</ContentPage>\n')
+        (proj / "MainPage.xaml").write_text(mainpage_xaml, encoding="utf-8")
+        mainpage_cs = (
+            "namespace " + app_name + ";\n\n"
+            "public partial class MainPage : ContentPage\n"
+            "{\n"
+            "    public MainPage()\n"
+            "    {\n"
+            "        InitializeComponent();\n"
+            "    }\n"
+            "}\n")
+        (proj / "MainPage.xaml.cs").write_text(mainpage_cs, encoding="utf-8")
+        logger.log(f"✅ MainPage générée (WebView → {url or 'https://example.com'})")
+
+    if icon_bytes:
+        icon_path = proj / "Resources" / "AppIcon" / "appicon.png"
+        icon_path.parent.mkdir(parents=True, exist_ok=True)
+        icon_path.write_bytes(make_icon_png(icon_bytes, 512))
+        logger.log("✅ Icône MAUI écrite (appicon.png)")
+
+    logger.log(f"✅ Projet .NET MAUI prêt : {proj}")
+    return proj
+
+
+def do_build_maui(config, icon_bytes, splash_bytes=None, site_zip_bytes=None):
+    global CURRENT_SESSION
+    logger = OPS["maui"]
+    sid = new_session_id()
+    logger.session = sid
+    # BUG-FIX (root cause) : voir commentaire équivalent dans do_build_native.
+    CURRENT_SESSION = sid
+    try:
+        proj = generate_maui_project(sid, config, icon_bytes, site_zip_bytes, logger)
+        dotnet = find_dotnet()
+        signing_mode = (config.get("signing") or {}).get("mode", "debug")
+        build_config = "Release" if signing_mode != "debug" else "Debug"
+        tfm = "net8.0-android"
+        logger.log(f"🔨 Compilation .NET MAUI ({build_config}, {tfm})...")
+        cmd = [dotnet, "build", str(proj), "-f", tfm, "-c", build_config,
+               "-p:AndroidPackageFormat=apk"]
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                            errors="replace", timeout=1800)
+        for line in (r.stdout or "").strip().split("\n"):
+            if line.strip(): logger.log(line)
+        if r.returncode != 0:
+            logger.log("⚠ " + (r.stderr or "")[:800])
+            raise RuntimeError("Échec de `dotnet build` — voir logs ci-dessus.")
+
+        apk_dir = proj / "bin" / build_config / tfm
+        candidates = list(apk_dir.glob("*-Signed.apk")) or list(apk_dir.glob("*.apk")) if apk_dir.exists() else []
+        if not candidates:
+            raise RuntimeError(f"Build MAUI terminé mais aucun APK trouvé dans {apk_dir}")
+        unsigned_apk = candidates[0]
+
+        app_name = (config.get("appName") or "MonApp").strip()
+        version_name = str(config.get("versionName") or "1.0")
+        out_name = f"{re.sub(r'[^A-Za-z0-9_.-]', '_', app_name)}_{version_name}_maui.apk"
+        min_sdk = config.get("minSdk") or MAUI_MIN_SDK_DEFAULT
+        signing = config.get("signing", {"mode": "debug"})
+        final_apk = sign_native_apk(unsigned_apk, signing, proj, out_name, min_sdk, logger)
+        logger.result_file = str(final_apk)
+        logger.status = "done"
+    except Exception as e:
+        import traceback
+        logger.log(f"❌ Erreur: {e}")
+        logger.log(traceback.format_exc())
+        logger.status = "error"
+
+
+# ---- Titanium --------------------------------------------------------
+
+def generate_titanium_project(sid, config, icon_bytes, site_zip_bytes, logger):
+    titanium = find_titanium()
+    if not titanium:
+        raise RuntimeError(
+            "Titanium CLI introuvable. Installe le composant 'titanium' depuis "
+            "l'écran des composants avant de générer une app Titanium."
+        )
+    env = _twa_env(logger)
+    app_name = (config.get("appName") or "MonApp").strip()
+    package = normalize_package_name(config.get("packageName"), fallback="com.example.titanium")
+    proj = titanium_project_dir(sid)
+    proj.parent.mkdir(parents=True, exist_ok=True)
+
+    logger.log("📦 Création du projet Titanium (titanium create)...")
+    cmd = [titanium, "create", "--type", "app", "--name", proj.name, "--id", package,
+           "--platforms", "android", "--workspace-dir", str(proj.parent), "--no-prompt", "-f"]
+    r = subprocess.run(cmd, env=env, capture_output=True, text=True,
+                        encoding="utf-8", errors="replace", timeout=300)
+    for line in (r.stdout or "").strip().split("\n"):
+        if line.strip(): logger.log(line)
+    if r.returncode != 0 or not proj.exists():
+        logger.log("⚠ " + (r.stderr or "")[:500])
+        raise RuntimeError("Échec de `titanium create` — voir logs ci-dessus.")
+
+    source_mode = (config.get("sourceMode") or "url").strip()
+    url = (config.get("appUrl") or "").strip()
+    resources = proj / "Resources"
+    if source_mode == "scratch":
+        webroot = resources / "www"
+        _write_webroot_from_config(webroot, config, site_zip_bytes, logger)
+        app_js = (
+            "var win = Ti.UI.createWindow({backgroundColor:'#fff'});\n"
+            "var webview = Ti.UI.createWebView({url:'www/index.html'});\n"
+            "win.add(webview);\n"
+            "win.open();\n")
+    else:
+        app_js = (
+            "var win = Ti.UI.createWindow({backgroundColor:'#fff'});\n"
+            f"var webview = Ti.UI.createWebView({{url:'{url or 'https://example.com'}'}});\n"
+            "win.add(webview);\n"
+            "win.open();\n")
+    (resources / "app.js").write_text(app_js, encoding="utf-8")
+
+    if icon_bytes:
+        (resources / "android" / "images" / "res-mdpi").mkdir(parents=True, exist_ok=True)
+        (resources / "android" / "images" / "res-mdpi" / "appicon.png").write_bytes(make_icon_png(icon_bytes, 48))
+        logger.log("✅ Icône Titanium écrite")
+
+    logger.log(f"✅ Projet Titanium prêt : {proj}")
+    return proj
+
+
+def do_build_titanium(config, icon_bytes, splash_bytes=None, site_zip_bytes=None):
+    global CURRENT_SESSION
+    logger = OPS["titanium"]
+    sid = new_session_id()
+    logger.session = sid
+    # BUG-FIX (root cause) : voir commentaire équivalent dans do_build_native.
+    CURRENT_SESSION = sid
+    try:
+        proj = generate_titanium_project(sid, config, icon_bytes, site_zip_bytes, logger)
+        titanium = find_titanium()
+        env = _twa_env(logger)
+        logger.log("🔨 Compilation Titanium (titanium build -p android -b)...")
+        cmd = [titanium, "build", "-p", "android", "-b", "-d", str(proj)]
+        r = subprocess.run(cmd, env=env, capture_output=True, text=True,
+                            encoding="utf-8", errors="replace", timeout=1800)
+        for line in (r.stdout or "").strip().split("\n"):
+            if line.strip(): logger.log(line)
+        if r.returncode != 0:
+            logger.log("⚠ " + (r.stderr or "")[:800])
+            raise RuntimeError("Échec de `titanium build` — voir logs ci-dessus.")
+
+        apk_dir = proj / "build" / "android" / "bin"
+        candidates = list(apk_dir.glob("*.apk")) if apk_dir.exists() else []
+        if not candidates:
+            raise RuntimeError(f"Build Titanium terminé mais aucun APK trouvé dans {apk_dir}")
+        unsigned_apk = candidates[0]
+
+        app_name = (config.get("appName") or "MonApp").strip()
+        version_name = str(config.get("versionName") or "1.0")
+        out_name = f"{re.sub(r'[^A-Za-z0-9_.-]', '_', app_name)}_{version_name}_titanium.apk"
+        min_sdk = config.get("minSdk") or TITANIUM_MIN_SDK_DEFAULT
+        signing = config.get("signing", {"mode": "debug"})
+        final_apk = sign_native_apk(unsigned_apk, signing, proj, out_name, min_sdk, logger)
         logger.result_file = str(final_apk)
         logger.status = "done"
     except Exception as e:
@@ -4695,8 +6687,7 @@ def generate_flutter_project(sid, config, icon_bytes, splash_bytes, site_zip_byt
 
     url = ""
     if source_mode == "scratch":
-        if not site_zip_bytes:
-            raise RuntimeError("Mode scratch : un zip du site (HTML/CSS/JS) est requis.")
+        pass  # site_zip_bytes optionnel : si absent, fallback sur le dossier-modele flutter (templates/flutter/webroot/)
     else:
         url = (config.get("url") or "").strip()
         if not url or not url.startswith(("http://", "https://")):
@@ -4735,26 +6726,35 @@ def generate_flutter_project(sid, config, icon_bytes, splash_bytes, site_zip_byt
 
     www_dir = proj / "assets" / "www"
     if source_mode == "scratch":
-        # ── Site local zippé : extrait dans assets/www/, puis déclaré
-        # dans pubspec.yaml (flutter: assets:) pour être bundlé dans
-        # l'APK — l'app n'a besoin d'aucune connexion réseau pour
-        # s'ouvrir (mêmes conventions d'extraction que le mode scratch
-        # Cordova : remontée d'un niveau si tout est dans un sous-dossier) ─
-        logger.log("🗂 Extraction du site local (zip)...")
-        www_dir.mkdir(parents=True, exist_ok=True)
-        zpath = proj / "site_upload.zip"
-        zpath.write_bytes(site_zip_bytes)
-        with zipfile.ZipFile(zpath) as zf:
-            _safe_extract_zip(zf, www_dir, logger)
-        children = list(www_dir.iterdir())
-        if len(children) == 1 and children[0].is_dir() and not (www_dir / "index.html").exists():
-            inner = children[0]
-            for item in inner.iterdir():
-                shutil.move(str(item), str(www_dir / item.name))
-            inner.rmdir()
-        zpath.unlink(missing_ok=True)
-        if not (www_dir / "index.html").exists():
-            raise RuntimeError("Pas d'index.html trouvé à la racine du zip fourni (ni dans un unique sous-dossier).")
+        if site_zip_bytes:
+            # ── Site local zippé : extrait dans assets/www/ (mêmes
+            # conventions d'extraction que le mode scratch Cordova :
+            # remontée d'un niveau si tout est dans un sous-dossier) ─────
+            logger.log("🗂 Extraction du site local (zip)...")
+            www_dir.mkdir(parents=True, exist_ok=True)
+            zpath = proj / "site_upload.zip"
+            zpath.write_bytes(site_zip_bytes)
+            with zipfile.ZipFile(zpath) as zf:
+                _safe_extract_zip(zf, www_dir, logger)
+            children = list(www_dir.iterdir())
+            if len(children) == 1 and children[0].is_dir() and not (www_dir / "index.html").exists():
+                inner = children[0]
+                for item in inner.iterdir():
+                    shutil.move(str(item), str(www_dir / item.name))
+                inner.rmdir()
+            zpath.unlink(missing_ok=True)
+            if not (www_dir / "index.html").exists():
+                raise RuntimeError("Pas d'index.html trouvé à la racine du zip fourni (ni dans un unique sous-dossier).")
+        else:
+            # Aucun zip fourni : l'IA compte écrire les fichiers ensuite via
+            # write_file — on part du dossier-modèle Flutter déjà arrangé
+            # (templates/flutter/webroot/), jamais d'assets/www/ vide.
+            if not stage_webroot_from_template("flutter", www_dir, logger):
+                www_dir.mkdir(parents=True, exist_ok=True)
+                (www_dir / "index.html").write_text(_SCRATCH_SKELETON_HTML, encoding="utf-8")
+                (www_dir / "style.css").write_text(_SCRATCH_SKELETON_CSS, encoding="utf-8")
+                (www_dir / "app.js").write_text(_SCRATCH_SKELETON_JS, encoding="utf-8")
+                logger.log("✅ Squelette Flutter écrit (assets/www/index.html + style.css + app.js).")
 
         asset_dirs = _flutter_collect_asset_dirs(www_dir)
         assets_yaml = "".join(f"    - {d}\n" for d in asset_dirs)
@@ -4766,7 +6766,8 @@ def generate_flutter_project(sid, config, icon_bytes, splash_bytes, site_zip_byt
             )
         else:
             pubspec += "\nflutter:\n  assets:\n" + assets_yaml
-        logger.log(f"✅ Site local extrait dans assets/www/ ({len(asset_dirs)} dossier(s) déclaré(s), app 100% hors-ligne)")
+        logger.log(f"✅ assets/www/ déclaré dans pubspec.yaml ({len(asset_dirs)} dossier(s), app 100% hors-ligne)")
+
 
     pubspec_path.write_text(pubspec, encoding="utf-8")
     logger.log("✅ pubspec.yaml patché (webview_flutter + version" + (" + assets" if source_mode == "scratch" else "") + ")")
@@ -4872,6 +6873,7 @@ class _WebViewScreenState extends State<WebViewScreen> {{
         _flutter_write_splash(proj, splash_bytes, logger)
 
     write_hybrid_session_meta(sid, "flutter", config)
+    enforce_project_entrypoint(sid, kind_hint="flutter", logger=logger)
     return proj
 
 
@@ -4983,6 +6985,7 @@ def generate_flutter_project_from_template(sid, config, icon_bytes, splash_bytes
             raise RuntimeError("Échec de `flutter pub get` sur le projet importé — voir logs ci-dessus.")
 
     write_hybrid_session_meta(sid, "flutter", config)
+    enforce_project_entrypoint(sid, kind_hint="flutter", logger=logger)
     return proj
 
 
@@ -5201,8 +7204,7 @@ def generate_react_native_project(sid, config, icon_bytes, splash_bytes, site_zi
 
     url = ""
     if source_mode == "scratch":
-        if not site_zip_bytes:
-            raise RuntimeError("Mode scratch : un zip du site (HTML/CSS/JS) est requis.")
+        pass  # site_zip_bytes optionnel : si absent, fallback sur le dossier-modele reactnative (templates/reactnative/webroot/)
     else:
         url = (config.get("url") or "").strip()
         if not url or not url.startswith(("http://", "https://")):
@@ -5243,30 +7245,41 @@ def generate_react_native_project(sid, config, icon_bytes, splash_bytes, site_zi
         raise RuntimeError("Échec de `npm install react-native-webview` — voir logs ci-dessus.")
 
     if source_mode == "scratch":
-        # ── Site local zippé : extrait directement dans les assets
-        # Android natifs (packagés dans l'APK par Gradle sans config
-        # supplémentaire), puis chargé via file:///android_asset/ — pas
-        # de mécanisme de bundling déclaratif côté RN comme pubspec.yaml,
-        # donc on passe par le dossier assets/ natif comme pour Cordova
-        # www/, mêmes conventions d'extraction (remontée d'un niveau si
-        # tout est dans un unique sous-dossier) ──────────────────────────
-        logger.log("🗂 Extraction du site local (zip)...")
         assets_www = proj / "android" / "app" / "src" / "main" / "assets" / "www"
-        assets_www.mkdir(parents=True, exist_ok=True)
-        zpath = proj / "site_upload.zip"
-        zpath.write_bytes(site_zip_bytes)
-        with zipfile.ZipFile(zpath) as zf:
-            _safe_extract_zip(zf, assets_www, logger)
-        children = list(assets_www.iterdir())
-        if len(children) == 1 and children[0].is_dir() and not (assets_www / "index.html").exists():
-            inner = children[0]
-            for item in inner.iterdir():
-                shutil.move(str(item), str(assets_www / item.name))
-            inner.rmdir()
-        zpath.unlink(missing_ok=True)
-        if not (assets_www / "index.html").exists():
-            raise RuntimeError("Pas d'index.html trouvé à la racine du zip fourni (ni dans un unique sous-dossier).")
-        logger.log("✅ Site local extrait dans android/app/src/main/assets/www/ (app 100% hors-ligne)")
+        if site_zip_bytes:
+            # ── Site local zippé : extrait directement dans les assets
+            # Android natifs (packagés dans l'APK par Gradle sans config
+            # supplémentaire), puis chargé via file:///android_asset/ — pas
+            # de mécanisme de bundling déclaratif côté RN comme pubspec.yaml,
+            # donc on passe par le dossier assets/ natif comme pour Cordova
+            # www/, mêmes conventions d'extraction (remontée d'un niveau si
+            # tout est dans un unique sous-dossier) ──────────────────────────
+            logger.log("🗂 Extraction du site local (zip)...")
+            assets_www.mkdir(parents=True, exist_ok=True)
+            zpath = proj / "site_upload.zip"
+            zpath.write_bytes(site_zip_bytes)
+            with zipfile.ZipFile(zpath) as zf:
+                _safe_extract_zip(zf, assets_www, logger)
+            children = list(assets_www.iterdir())
+            if len(children) == 1 and children[0].is_dir() and not (assets_www / "index.html").exists():
+                inner = children[0]
+                for item in inner.iterdir():
+                    shutil.move(str(item), str(assets_www / item.name))
+                inner.rmdir()
+            zpath.unlink(missing_ok=True)
+            if not (assets_www / "index.html").exists():
+                raise RuntimeError("Pas d'index.html trouvé à la racine du zip fourni (ni dans un unique sous-dossier).")
+            logger.log("✅ Site local extrait dans android/app/src/main/assets/www/ (app 100% hors-ligne)")
+        else:
+            # Aucun zip fourni : l'IA compte écrire les fichiers ensuite via
+            # write_file — on part du dossier-modèle React Native déjà
+            # arrangé (templates/reactnative/webroot/), jamais d'assets/www/ vide.
+            if not stage_webroot_from_template("reactnative", assets_www, logger):
+                assets_www.mkdir(parents=True, exist_ok=True)
+                (assets_www / "index.html").write_text(_SCRATCH_SKELETON_HTML, encoding="utf-8")
+                (assets_www / "style.css").write_text(_SCRATCH_SKELETON_CSS, encoding="utf-8")
+                (assets_www / "app.js").write_text(_SCRATCH_SKELETON_JS, encoding="utf-8")
+                logger.log("✅ Squelette React Native écrit (android/app/src/main/assets/www/index.html + style.css + app.js).")
 
     # ── App.tsx (ou App.js selon la version du template) : remplace
     # l'écran de démarrage par une WebView plein écran ──────────────────
@@ -5341,6 +7354,7 @@ export default App;
         _rn_write_splash(proj, splash_bytes, logger)
 
     write_hybrid_session_meta(sid, "reactnative", config)
+    enforce_project_entrypoint(sid, kind_hint="reactnative", logger=logger)
     return proj
 
 
@@ -5459,6 +7473,7 @@ def generate_react_native_project_from_template(sid, config, icon_bytes, splash_
             raise RuntimeError("Échec de `npm install` sur le projet importé — voir logs ci-dessus.")
 
     write_hybrid_session_meta(sid, "reactnative", config)
+    enforce_project_entrypoint(sid, kind_hint="reactnative", logger=logger)
     return proj
 
 
@@ -5467,8 +7482,8 @@ def do_generate_rn_session(config, icon_bytes, splash_bytes=None, site_zip_bytes
     session éditable dans l'explorer avant compilation séparée via
     /build-rn avec {"session": sid}. Token OPS['rn_gen'].
     Dispatch sur config['sourceMode'] : 'url' (défaut) / 'scratch' / 'template'."""
-    logger = OPS["rn_gen"] = OpLogger()
-    logger.lines = []; logger.status = "building"; logger.result_file = None
+    global CURRENT_SESSION
+    logger = OPS["rn_gen"]  # déjà réservé (status="building") par try_reserve_op() côté handler HTTP
     sid = new_session_id()
     logger.session = sid
     try:
@@ -5477,6 +7492,9 @@ def do_generate_rn_session(config, icon_bytes, splash_bytes=None, site_zip_bytes
             generate_react_native_project_from_template(sid, config, icon_bytes, splash_bytes, project_zip_bytes, logger)
         else:
             generate_react_native_project(sid, config, icon_bytes, splash_bytes, site_zip_bytes, logger)
+        # BUG-FIX : voir do_generate_cordova_session — même correctif pour
+        # que /tree et /recompile pointent vers le projet RN fraîchement créé.
+        CURRENT_SESSION = sid
         logger.log(f"✅ Projet React Native prêt — session {sid} (modifiable dans l'explorer)")
         logger.status = "done"
     except Exception as e:
@@ -5497,8 +7515,7 @@ def do_build_react_native(config, icon_bytes, splash_bytes=None, site_zip_bytes=
     /rn-generate, potentiellement modifiée dans l'explorer), on saute la
     (re)génération et on compile directement le projet existant.
     """
-    logger = OPS["rn"] = OpLogger()
-    logger.lines = []; logger.status = "building"; logger.result_file = None
+    logger = OPS["rn"]  # déjà réservé (status="building") par try_reserve_op() côté handler HTTP
     existing_sid = (config.get("session") or "").strip()
     if existing_sid:
         sid = existing_sid
@@ -5508,6 +7525,7 @@ def do_build_react_native(config, icon_bytes, splash_bytes=None, site_zip_bytes=
             if not proj.exists():
                 raise RuntimeError(f"Session {sid} introuvable ou projet React Native absent — régénère.")
             logger.log(f"♻ Compilation depuis la session existante {sid} (fichiers tels que modifiés)")
+            _assert_entrypoint_ready(sid, "reactnative", logger)
             android_dir = proj / "android"
             unsigned_apk = run_gradle_build(android_dir, logger, "assembleRelease")
             app_name = (config.get("appName") or "MonApp").strip()
@@ -5526,12 +7544,16 @@ def do_build_react_native(config, icon_bytes, splash_bytes=None, site_zip_bytes=
         return
     sid = new_session_id()
     logger.session = sid
+    # BUG-FIX (root cause) : voir commentaire équivalent dans do_build_native.
+    global CURRENT_SESSION
+    CURRENT_SESSION = sid
     try:
         source_mode = (config.get("sourceMode") or "url").strip()
         if source_mode == "template":
             proj = generate_react_native_project_from_template(sid, config, icon_bytes, splash_bytes, project_zip_bytes, logger)
         else:
             proj = generate_react_native_project(sid, config, icon_bytes, splash_bytes, site_zip_bytes, logger)
+        _assert_entrypoint_ready(sid, "reactnative", logger)
         android_dir = proj / "android"
         unsigned_apk = run_gradle_build(android_dir, logger, "assembleRelease")
 
@@ -5556,8 +7578,8 @@ def do_generate_flutter_session(config, icon_bytes, splash_bytes=None, site_zip_
     éditable dans l'explorer avant compilation séparée via /build-flutter
     avec {"session": sid}. Token OPS['flutter_gen'].
     Dispatch sur config['sourceMode'] : 'url' (défaut) / 'scratch' / 'template'."""
-    logger = OPS["flutter_gen"] = OpLogger()
-    logger.lines = []; logger.status = "building"; logger.result_file = None
+    global CURRENT_SESSION
+    logger = OPS["flutter_gen"]  # déjà réservé (status="building") par try_reserve_op() côté handler HTTP
     sid = new_session_id()
     logger.session = sid
     try:
@@ -5566,6 +7588,9 @@ def do_generate_flutter_session(config, icon_bytes, splash_bytes=None, site_zip_
             generate_flutter_project_from_template(sid, config, icon_bytes, splash_bytes, project_zip_bytes, logger)
         else:
             generate_flutter_project(sid, config, icon_bytes, splash_bytes, site_zip_bytes, logger)
+        # BUG-FIX : voir do_generate_cordova_session — même correctif pour
+        # que /tree et /recompile pointent vers le projet Flutter fraîchement créé.
+        CURRENT_SESSION = sid
         logger.log(f"✅ Projet Flutter prêt — session {sid} (modifiable dans l'explorer)")
         logger.status = "done"
     except Exception as e:
@@ -5586,8 +7611,7 @@ def do_build_flutter(config, icon_bytes, splash_bytes=None, site_zip_bytes=None,
     /flutter-generate, potentiellement modifiée dans l'explorer), on
     saute la (re)génération et on compile directement le projet existant.
     """
-    logger = OPS["flutter"] = OpLogger()
-    logger.lines = []; logger.status = "building"; logger.result_file = None
+    logger = OPS["flutter"]  # déjà réservé (status="building") par try_reserve_op() côté handler HTTP
     existing_sid = (config.get("session") or "").strip()
     if existing_sid:
         sid = existing_sid
@@ -5597,6 +7621,7 @@ def do_build_flutter(config, icon_bytes, splash_bytes=None, site_zip_bytes=None,
             if not proj.exists():
                 raise RuntimeError(f"Session {sid} introuvable ou projet Flutter absent — régénère.")
             logger.log(f"♻ Compilation depuis la session existante {sid} (fichiers tels que modifiés)")
+            _assert_entrypoint_ready(sid, "flutter", logger)
             build_type = "debug" if (config.get("signing", {}).get("mode") == "debug") else "release"
             unsigned_apk = run_flutter_build(proj, logger, build_type)
             app_name = (config.get("appName") or "MonApp").strip()
@@ -5615,12 +7640,16 @@ def do_build_flutter(config, icon_bytes, splash_bytes=None, site_zip_bytes=None,
         return
     sid = new_session_id()
     logger.session = sid
+    # BUG-FIX (root cause) : voir commentaire équivalent dans do_build_native.
+    global CURRENT_SESSION
+    CURRENT_SESSION = sid
     try:
         source_mode = (config.get("sourceMode") or "url").strip()
         if source_mode == "template":
             proj = generate_flutter_project_from_template(sid, config, icon_bytes, splash_bytes, project_zip_bytes, logger)
         else:
             proj = generate_flutter_project(sid, config, icon_bytes, splash_bytes, site_zip_bytes, logger)
+        _assert_entrypoint_ready(sid, "flutter", logger)
         build_type = "debug" if (config.get("signing", {}).get("mode") == "debug") else "release"
         unsigned_apk = run_flutter_build(proj, logger, build_type)
 
@@ -5687,6 +7716,150 @@ def convert_aab_to_universal_apk(aab_path, work_dir, logger):
             shutil.copyfileobj(src, dst)
     logger.log(f"✅ APK universel généré depuis le bundle : {universal_apk.name}")
     return universal_apk
+
+
+def export_as_xapk(apk_path, logger, out_name=None):
+    """
+    Empaquette un APK déjà compilé/signé dans le format .xapk (utilisé par
+    APKPure/APKMirror et compatible avec les installeurs XAPK type SAI).
+    Un .xapk est un simple ZIP contenant :
+      - l'APK lui-même (nom = package.apk)
+      - manifest.json (métadonnées : package, version, nom, icône)
+      - icon.png (si trouvable dans l'APK)
+    Ce n'est PAS une reconstruction : l'APK à l'intérieur reste strictement
+    l'APK d'origine, déjà signé — le .xapk n'est qu'un conteneur de
+    distribution autour, donc aucune re-signature n'est nécessaire ici.
+    """
+    apk_path = Path(apk_path)
+    if not apk_path.exists():
+        raise RuntimeError(f"APK introuvable : {apk_path}")
+
+    logger.log("📦 Extraction du package/version depuis l'APK (aapt)…")
+    package_name, version_name, app_label = _read_apk_identity(apk_path, logger)
+
+    manifest = {
+        "xapk_version": 2,
+        "package_name": package_name or "unknown.package",
+        "name": app_label or apk_path.stem,
+        "version_name": version_name or "1.0",
+        "version_code": "1",
+        "min_sdk_version": "21",
+        "target_sdk_version": "34",
+        "split_configs": [],
+        "permissions": [],
+    }
+
+    out_name = out_name or (apk_path.stem + ".xapk")
+    out_path = OUTPUT_DIR / out_name
+    with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.write(apk_path, arcname=f"{manifest['package_name']}.apk")
+        zf.writestr("manifest.json", json.dumps(manifest, indent=2, ensure_ascii=False))
+        icon_bytes = _extract_apk_icon(apk_path, logger)
+        if icon_bytes:
+            zf.writestr("icon.png", icon_bytes)
+
+    logger.log(f"✅ XAPK généré : {out_path.name}")
+    return out_path
+
+
+def _read_apk_identity(apk_path, logger):
+    """Lit package/versionName/label via aapt (déjà utilisé ailleurs dans
+    le pipeline signature/inspection) — renvoie (None, None, None) si aapt
+    est indisponible plutôt que d'échouer tout l'export pour un détail
+    cosmétique du manifest.json."""
+    aapt = find_tool("aapt") or find_tool("aapt2")
+    if not aapt:
+        logger.log("⚠ aapt introuvable — manifest.json du XAPK restera générique")
+        return None, None, None
+    try:
+        r = subprocess.run([aapt, "dump", "badging", str(apk_path)],
+                            capture_output=True, text=True, timeout=30)
+        out = r.stdout or ""
+        pkg = re.search(r"package: name='([^']+)'", out)
+        ver = re.search(r"versionName='([^']+)'", out)
+        label = re.search(r"application-label:'([^']+)'", out)
+        return (pkg.group(1) if pkg else None,
+                ver.group(1) if ver else None,
+                label.group(1) if label else None)
+    except Exception as e:
+        logger.log(f"⚠ Lecture identité APK échouée : {e}")
+        return None, None, None
+
+
+def _extract_apk_icon(apk_path, logger):
+    """Récupère la plus grosse icône PNG mipmap/drawable trouvée dans
+    l'APK pour l'inclure en icon.png du XAPK — best-effort, jamais bloquant."""
+    try:
+        with zipfile.ZipFile(apk_path) as zf:
+            candidates = [n for n in zf.namelist()
+                          if re.search(r"(mipmap|drawable).*ic_launcher.*\.png$", n)]
+            if not candidates:
+                return None
+            candidates.sort(key=lambda n: zf.getinfo(n).file_size, reverse=True)
+            return zf.read(candidates[0])
+    except Exception as e:
+        logger.log(f"⚠ Extraction icône XAPK échouée : {e}")
+        return None
+
+
+def export_as_split_apks(aab_path, work_dir, logger, signing=None, out_name=None):
+    """
+    Génère de VRAIS Split APK (base + splits par ABI/densité/langue) à
+    partir d'un App Bundle (.aab) via bundletool build-apks --mode=default,
+    puis regroupe le tout dans un .zip téléchargeable.
+    IMPORTANT — limite honnête : un split APK correct ne peut être dérivé
+    QUE d'un .aab source (le bundle contient les métadonnées de découpage
+    par configuration). Il n'existe PAS de méthode fiable pour re-découper
+    un APK universel déjà fusionné après coup ; si le projet n'a produit
+    qu'un .apk (apktool/scratch/cordova...), ce chemin n'est pas proposé —
+    voir la vérification faite par l'appelant HTTP (/export-package).
+    """
+    bundletool = find_bundletool()
+    if not bundletool:
+        raise RuntimeError(
+            "bundletool introuvable. Installe le composant 'bundletool' depuis "
+            "l'écran des composants pour générer des split APK."
+        )
+    java = find_tool("java")
+    if not java:
+        raise RuntimeError("Java non trouvé — installe le composant 'jdk'.")
+
+    work_dir = Path(work_dir)
+    apks_out = work_dir / "splits.apks"
+    apks_out.unlink(missing_ok=True)
+
+    signing_mode = (signing or {}).get("mode", "debug")
+    if signing_mode == "custom" and signing.get("keystoreB64"):
+        ks = work_dir / "split_signing.keystore"
+        ks.write_bytes(base64.b64decode(signing["keystoreB64"]))
+        alias = signing.get("alias") or "key0"
+        ks_pass = signing.get("storePass") or "android"
+        key_pass = signing.get("keyPass") or ks_pass
+    else:
+        ks = TOOLS_DIR / "debug.keystore"
+        if not ks.exists():
+            raise RuntimeError("debug.keystore introuvable — relance launcher.bat.")
+        alias, ks_pass, key_pass = "androiddebugkey", "android", "android"
+
+    logger.log("📦 Génération des split APK (mode=default) via bundletool…")
+    cmd = [java, "-jar", bundletool, "build-apks",
+           "--bundle", str(aab_path), "--output", str(apks_out),
+           "--mode=default",
+           "--ks", str(ks), "--ks-pass", f"pass:{ks_pass}",
+           "--ks-key-alias", alias, "--key-pass", f"pass:{key_pass}",
+           "--overwrite"]
+    ok = run_cmd(cmd, logger, timeout=300)
+    if not ok or not apks_out.exists():
+        raise RuntimeError("Échec de la génération des split APK (voir logs bundletool).")
+
+    out_name = out_name or (Path(aab_path).stem + "-splits.zip")
+    out_path = OUTPUT_DIR / out_name
+    # Le .apks produit par bundletool EST déjà un zip contenant les splits
+    # (toc.pb + splits/*.apk) — on le republie simplement sous un nom
+    # explicite dans OUTPUT_DIR plutôt que de tout ré-extraire/re-zipper.
+    shutil.copy(apks_out, out_path)
+    logger.log(f"✅ Split APK générés : {out_path.name}")
+    return out_path
 
 
 def _is_aab_bytes(data):
@@ -5757,7 +7930,8 @@ def do_jadx_decompile(apk_bytes, logger):
     zippe le résultat dans OUTPUT_DIR pour téléchargement — même schéma
     que les autres opérations (OPS token dédié 'jadx', poll via /status).
     """
-    logger.lines = []; logger.status = "building"; logger.result_file = None
+    # logger déjà réservé (status="building", lines=[], result_file=None)
+    # par try_reserve_op() côté handler HTTP avant le démarrage du thread.
     try:
         jadx = find_jadx()
         if not jadx:
@@ -5824,8 +7998,7 @@ def do_jadx_decompile(apk_bytes, logger):
 # =============================================================
 def do_build_scratch(config, icon_bytes, splash_bytes, site_zip_bytes):
     """Build APK sans template (mode scratch)."""
-    logger = OPS["legacy"]
-    logger.lines = []; logger.status = "building"; logger.result_file = None
+    logger = OPS["legacy"]  # déjà réservé (status="building") par try_reserve_op() côté handler HTTP
     keep_session = bool(config.get("keepSession"))
     sid = None
     try:
@@ -5853,8 +8026,7 @@ def do_build_scratch(config, icon_bytes, splash_bytes, site_zip_bytes):
 
 def do_build_legacy(config, template_bytes, icon_bytes, splash_bytes, site_zip_bytes):
     """Build APK depuis un template (décompile + patch + recompile)."""
-    logger = OPS["legacy"]
-    logger.lines = []; logger.status = "building"; logger.result_file = None
+    logger = OPS["legacy"]  # déjà réservé (status="building") par try_reserve_op() côté handler HTTP
     keep_session = bool(config.get("keepSession"))
     sid = None
     try:
@@ -5959,8 +8131,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             filename = unquote(path.replace("/download/", ""))
             filepath = OUTPUT_DIR / filename
             if filepath.exists():
-                content_type = "application/zip" if filename.lower().endswith(".zip") \
-                    else "application/vnd.android.package-archive"
+                low = filename.lower()
+                if low.endswith(".zip"):
+                    content_type = "application/zip"
+                elif low.endswith(".pdf"):
+                    content_type = "application/pdf"
+                else:
+                    content_type = "application/vnd.android.package-archive"
                 self.send_response(200)
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
@@ -6008,8 +8185,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "jarsigner":            bool(find_tool("jarsigner")),
                 "template":             (BASE_DIR / "template.apk").exists(),
                 "keystore":             (TOOLS_DIR / "debug.keystore").exists(),
-                "customKeystoreExists": (TOOLS_DIR / "mon.keystore").exists(),
-                "customKeystoreName":   "mon.keystore" if (TOOLS_DIR / "mon.keystore").exists() else None,
+                "customKeystoreExists": _find_custom_keystore() is not None,
+                "customKeystoreName":   _find_custom_keystore(),
                 "buildToolsVersion":    bt,
                 "sdkPresent":           SDK_DIR.exists(),
                 "scratchMode":          True,
@@ -6046,6 +8223,47 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._err(str(e), 500)
             return
 
+        # ── /entrypoint : LA réponse faisant autorité sur "quel est le bon
+        # chemin" pour le point d'entrée web/natif d'une session — appelée
+        # par l'agent IA avant d'écrire index.html/style.css/app.js, au lieu
+        # qu'il redevine lui-même le dossier depuis l'arborescence. Ne fait
+        # AUCUNE écriture destructive au-delà du nettoyage habituel des 4
+        # noms de fichiers webview connus (voir enforce_project_entrypoint).
+        if path == "/entrypoint":
+            sid = qs.get("session", [""])[0] or CURRENT_SESSION
+            if not sid:
+                self._err("Aucun projet chargé", 404); return
+            try:
+                class _NullLogger:
+                    def log(self, *_a, **_k): pass
+                report = enforce_project_entrypoint(sid, kind_hint=None, logger=_NullLogger())
+                self._json(report)
+            except Exception as e:
+                self._err(str(e), 500)
+            return
+
+        if path == "/session-identity":
+            sid = qs.get("session", [""])[0] or CURRENT_SESSION
+            if not sid:
+                self._json({"identity": None}); return
+            try:
+                meta_f = session_dir(sid) / "session.json"
+                meta = json.loads(meta_f.read_text(encoding="utf-8")) if meta_f.exists() else {}
+                identity = meta.get("identity")
+                icon_b64 = None
+                icon_mime = None
+                if identity and identity.get("iconRelPath"):
+                    try:
+                        raw = read_binary_raw(sid, identity["iconRelPath"])
+                        icon_b64 = base64.b64encode(raw).decode()
+                        icon_mime = "image/png"
+                    except Exception:
+                        pass
+                self._json({"identity": identity, "iconBase64": icon_b64, "iconMime": icon_mime})
+            except Exception as e:
+                self._err(e, 500)
+            return
+
         if path == "/tree":
             sid = qs.get("session", [""])[0] or CURRENT_SESSION
             rel = qs.get("path", [""])[0]
@@ -6070,6 +8288,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self._json({"entries": entries})
                 except Exception as e:
                     self._err(e, 404)
+            return
+
+        # Vrai squelette de dossiers/sous-dossiers pour un type d'APK donné,
+        # lu directement sur le disque (templates/<type>/...) — fonctionne
+        # SANS session active, SANS avoir jamais ouvert l'IA. Utilisé par
+        # l'explorateur de gauche pour montrer où l'IA injectera ses
+        # fichiers avant même la création d'un premier projet.
+        if path == "/template-tree":
+            apk_type = qs.get("type", [""])[0]
+            try:
+                data = list_template_tree(apk_type)
+                data["mountPrefix"] = TEMPLATE_MOUNT_PREFIX.get(apk_type)
+                self._json(data)
+            except Exception as e:
+                self._err(e, 500)
             return
 
         if path == "/file":
@@ -6139,6 +8372,49 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._err(e, 404)
             return
 
+        # ── /download-file : téléchargement GÉNÉRIQUE d'un fichier d'une
+        # session (PDF, image, zip, texte...) depuis le chat IA — contrairement
+        # à /download (réservé aux APK/ZIP déjà déposés dans OUTPUT_DIR), cet
+        # endpoint sert n'importe quel fichier produit dans une session via
+        # write_file / write_file_safe, avec le bon Content-Type déduit de
+        # l'extension, et force le téléchargement (Content-Disposition).
+        if path == "/download-file":
+            sid = qs.get("session", [""])[0] or CURRENT_SESSION
+            rel = qs.get("path", [""])[0]
+            if not sid or not rel:
+                self._err("Paramètres 'session' et 'path' requis", 400); return
+            try:
+                data = read_binary_raw(sid, rel)
+                filename = os.path.basename(rel) or "fichier.bin"
+                ext = os.path.splitext(filename)[1].lower()
+                mime_map = {
+                    ".pdf":  "application/pdf",
+                    ".zip":  "application/zip",
+                    ".apk":  "application/vnd.android.package-archive",
+                    ".png":  "image/png",
+                    ".jpg":  "image/jpeg",
+                    ".jpeg": "image/jpeg",
+                    ".webp": "image/webp",
+                    ".gif":  "image/gif",
+                    ".svg":  "image/svg+xml",
+                    ".txt":  "text/plain; charset=utf-8",
+                    ".json": "application/json; charset=utf-8",
+                    ".html": "text/html; charset=utf-8",
+                    ".csv":  "text/csv; charset=utf-8",
+                }
+                content_type = mime_map.get(ext, "application/octet-stream")
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+                self.send_header("Content-Length", str(len(data)))
+                self.send_cors(); self.end_headers()
+                self.wfile.write(data)
+            except FileNotFoundError:
+                self._err("Fichier introuvable dans la session", 404)
+            except Exception as e:
+                self._err(e, 404)
+            return
+
         # ── /list-images : retourne toutes les images PNG/JPG/WEBP de la session ──
         # Utilisé par le sélecteur de splash dans le formulaire pour montrer
         # toutes les images existantes de l'APK et permettre de choisir lesquelles
@@ -6197,6 +8473,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._err(e, 400)
             return
 
+        # ── /detect-apk-type : espace de travail universel — détection
+        # déterministe (empreintes de fichiers, pas d'IA) du framework
+        # d'origine d'un APK décompilé + liste des outils requis pour ce
+        # type précis. L'IA prend ensuite le relais côté client pour
+        # vérifier ce qui manque réellement (check_missing_components) et
+        # chercher ce qui n'est pas dans le registre (search_missing_component).
+        if path == "/detect-apk-type":
+            sid = qs.get("session", [""])[0] or CURRENT_SESSION
+            if not sid:
+                self._err("Aucun projet chargé", 404); return
+            try:
+                self._json(detect_decompiled_apk_type(sid))
+            except Exception as e:
+                self._err(e, 500)
+            return
+
         # ── /smali-facts : scan guidé (couleurs, textes, durées, URLs) ──────
         # Permet à un utilisateur ne connaissant pas la syntaxe smali de voir
         # et modifier les valeurs courantes via une interface simple.
@@ -6210,6 +8502,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._err(e, 500)
             return
 
+        # ── /ui-facts : « Mode Profondeur » — TOUT le texte/boutons affichés
+        # dans l'APK (strings.xml + layouts + textes smali bruts), en une
+        # seule liste visuelle groupée par type, éditable/supprimable sans
+        # connaître XML ni smali.
+        if path == "/ui-facts":
+            sid = qs.get("session", [""])[0] or CURRENT_SESSION
+            if not sid: self._err("Aucun projet chargé", 404); return
+            try:
+                facts = scan_ui_facts(sid)
+                self._json({"facts": facts, "count": len(facts)})
+            except Exception as e:
+                self._err(e, 500)
+            return
+
         # ── /bug-log : journal persistant (logs auto + bugs signalés) ───────
         # + état de santé agrégé (vert/jaune/rouge) pour l'indicateur de l'UI.
         if path == "/bug-log":
@@ -6217,6 +8523,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 entries = list(reversed(_buglog_read()))  # plus récent en premier
                 health = buglog_compute_health()
                 self._json({"entries": entries, "health": health})
+            except Exception as e:
+                self._err(e, 500)
+            return
+
+        # ── /entrypoint : rapport EN DIRECT du dossier racine web réellement
+        # actif pour cette session (assets/, www/, assets/www/, .../www/, ou
+        # aucun pour flutter-natif/native/twa), + le chemin exact du point
+        # d'entrée. Read-only côté résultat affiché : réutilise le même code
+        # que celui appelé avant chaque build (enforce_project_entrypoint),
+        # donc CE endpoint fait autorité — c'est lui que builder.html appelle
+        # pour afficher un chemin garanti exact dans le panneau "espace de
+        # travail IA", au lieu d'un chemin statique deviné côté client.
+        if path == "/entrypoint":
+            sid = qs.get("session", [""])[0] or CURRENT_SESSION
+            if not sid:
+                self._err("Aucun projet chargé", 404); return
+            try:
+                report = enforce_project_entrypoint(sid)
+                self._json(report)
             except Exception as e:
                 self._err(e, 500)
             return
@@ -6285,7 +8610,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
         qs = parse_qs(parsed.query)
         if parsed.path == "/session":
             sid = qs.get("session", [""])[0]
-            delete_session(sid); OPS.pop(sid, None)
+            if not sid:
+                self._err("Paramètre 'session' manquant", 400); return
+            try:
+                delete_session(sid)
+            except RuntimeError as e:
+                # Session en cours de compilation — refus propre (409),
+                # jamais de suppression forcée qui casserait le build actif.
+                self._err(str(e), 409); return
+            # BUG CORRIGÉ : `OPS.pop(sid, None)` ne faisait jamais rien, car
+            # OPS est indexé par NOM DE MODE ("legacy", "native", "twa"...),
+            # jamais par id de session — sid ne correspond à aucune de ces
+            # clés. Ici on retrouve plutôt le(s) logger(s) qui pointaient sur
+            # cette session (op.session == sid) et on les réinitialise à
+            # l'état neutre, pour qu'un /status ultérieur sur ce token
+            # n'affiche plus une session qui n'existe plus sur disque.
+            for op in OPS.values():
+                if op.session == sid:
+                    op.session = None
+                    op.result_file = None
             if CURRENT_SESSION == sid: CURRENT_SESSION = None
             self._json({"deleted": sid}); return
         if parsed.path == "/file":
@@ -6348,6 +8691,46 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # Utilisé par la recherche texte globale pour un "rechercher/remplacer"
         # contrôlé : on vérifie l'ancien contenu avant d'écrire pour éviter
         # d'écraser une ligne modifiée entre-temps par autre chose.
+        # ── /export-package : convertit un APK/AAB déjà buildé (présent
+        # dans OUTPUT_DIR) vers un format d'export supplémentaire (xapk,
+        # split). Contrairement aux endpoints /build-*, c'est une simple
+        # opération de packaging sur un fichier existant (quelques
+        # secondes) — traitée en synchrone, sans passer par le système de
+        # polling token/status utilisé pour les vrais builds. ──────────
+        if path == "/export-package":
+            payload = self._read_json_body()
+            src_name = payload.get("file", "")
+            fmt = (payload.get("format") or "").lower()
+            signing = payload.get("signing") or {"mode": "debug"}
+            if not src_name or fmt not in ("xapk", "split"):
+                self._err("Paramètres invalides : 'file' requis, 'format' doit être 'xapk' ou 'split'.", 400); return
+            src_path = OUTPUT_DIR / src_name
+            if not src_path.exists() or OUTPUT_DIR not in src_path.resolve().parents:
+                self._err("Fichier source introuvable dans output/.", 404); return
+            logger = OpLogger()
+            try:
+                if fmt == "xapk":
+                    if src_path.suffix.lower() != ".apk":
+                        self._err("Export XAPK : le fichier source doit être un .apk déjà compilé/signé.", 400); return
+                    out_path = export_as_xapk(src_path, logger)
+                else:  # split
+                    if src_path.suffix.lower() != ".aab":
+                        self._err(
+                            "Export Split APK : nécessite un vrai .aab en source — un .apk déjà "
+                            "fusionné (apktool/scratch/cordova/natif classique) ne peut pas être "
+                            "redécoupé après coup. Compile d'abord en sortie .aab si ton mode de "
+                            "build le permet.", 400); return
+                    work_dir = OUTPUT_DIR / f"_tmp_split_{int(time.time())}"
+                    work_dir.mkdir(parents=True, exist_ok=True)
+                    try:
+                        out_path = export_as_split_apks(src_path, work_dir, logger, signing=signing)
+                    finally:
+                        shutil.rmtree(work_dir, ignore_errors=True)
+                self._json({"started": True, "done": True, "file": out_path.name, "logsTail": "\n".join(logger.lines[-50:])})
+            except Exception as e:
+                self._err(str(e), 500)
+            return
+
         if path == "/replace-line":
             payload = self._read_json_body()
             sid = payload.get("session") or CURRENT_SESSION
@@ -6362,6 +8745,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._json({"updated": True, "path": rel, "line": line_no})
             except Exception as e:
                 self._err(e, 400)
+            return
+
+        # ── /force-delete-with-deps : suppression FORCÉE et déterministe,
+        # sans passer par l'IA (contrairement à delete_path côté agent qui
+        # peut se tromper ou annoncer une suppression jamais faite). Supprime
+        # le fichier pour de vrai, scanne tout le projet pour les dépendances,
+        # nettoie automatiquement le motif smali sûr reconnu, et liste le
+        # reste pour revue.
+        if path == "/force-delete-with-deps":
+            payload = self._read_json_body()
+            sid = payload.get("session") or CURRENT_SESSION
+            rel = payload.get("path")
+            if not sid or not rel:
+                self._err("Paramètres manquants (session, path)", 400); return
+            try:
+                result = force_delete_with_refs(sid, rel)
+                self._json(result)
+            except FileNotFoundError as e:
+                self._err(str(e) or "Fichier introuvable", 404)
+            except Exception as e:
+                self._err(e, 500)
             return
 
         # ── /smali-apply : applique l'édition guidée d'une valeur smali ─────
@@ -6387,10 +8791,73 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json({"results": results})
             return
 
+        # ── /ui-apply : applique l'édition/suppression d'un texte ou bouton
+        # détecté par /ui-facts (Mode Profondeur). "Supprimer" = vider le
+        # texte (chaîne vide) plutôt que retirer la ligne entière : ça évite
+        # de casser une référence @string/xxx utilisée ailleurs (manifest,
+        # autre layout...) ou de décaler les lignes suivantes d'un fichier
+        # encore ouvert côté client.
+        if path == "/ui-apply":
+            payload = self._read_json_body()
+            sid = payload.get("session") or CURRENT_SESSION
+            edits = payload.get("edits")
+            if not edits and payload.get("id") is not None:
+                edits = [{"id": payload.get("id"), "value": payload.get("value", "")}]
+            if not sid or not edits:
+                self._err("Paramètres manquants (session, edits)", 400); return
+            results = []
+            for edit in edits:
+                fid = edit.get("id")
+                val = edit.get("value", "")
+                try:
+                    apply_ui_fact(sid, fid, val)
+                    results.append({"id": fid, "ok": True})
+                except Exception as e:
+                    results.append({"id": fid, "ok": False, "error": str(e)})
+            self._json({"results": results})
+            return
+
+        # ── /ui-disable-block : va plus loin que /ui-apply — au lieu de
+        # vider seulement le texte, neutralise TOUTE la méthode smali qui
+        # affiche l'élément (dialogue/bandeau entier : fond, texte, boutons).
+        if path == "/ui-disable-block":
+            payload = self._read_json_body()
+            sid = payload.get("session") or CURRENT_SESSION
+            fid = payload.get("id")
+            if not sid or not fid:
+                self._err("Paramètres manquants (session, id)", 400); return
+            try:
+                result = disable_ui_fact_block(sid, fid)
+                self._json({"ok": True, **result})
+            except Exception as e:
+                self._json({"ok": False, "error": str(e)})
+            return
+
+        # ── /ui-disable-all-popups : bouton dev — scanne TOUT le projet et
+        # neutralise d'un coup chaque popup/dialogue codé en dur (même
+        # mécanisme que /ui-disable-block, appliqué à toutes les occurrences
+        # trouvées). Ne touche jamais une méthode non-void : listée à part.
+        if path == "/ui-disable-all-popups":
+            payload = self._read_json_body()
+            sid = payload.get("session") or CURRENT_SESSION
+            force = bool(payload.get("force"))
+            if not sid:
+                self._err("Paramètre manquant (session)", 400); return
+            try:
+                results = disable_all_popup_methods(sid, force=force)
+                counts = {}
+                for r in results:
+                    counts[r["status"]] = counts.get(r["status"], 0) + 1
+                print(f"[popups] Résumé session {sid} (force={force}) : {counts}")
+                self._json({"ok": True, "results": results, "counts": counts, "force": force})
+            except Exception as e:
+                self._json({"ok": False, "error": str(e)})
+            return
+
         # ── /build-scratch : génère APK de ZÉRO, sans template ──────────────
         if path == "/build-scratch":
-            op = OPS["legacy"]
-            if op.status == "building":
+            op = try_reserve_op("legacy")
+            if op is None:
                 self._err("Build déjà en cours", 409); return
             payload = self._read_json_body()
             config        = payload.get("config", payload)
@@ -6411,8 +8878,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # ── /build-native : génère + compile une app NATIVE (Kotlin/Gradle) ──
         # depuis zéro, indépendamment du pipeline WebView/smali ci-dessus.
         if path == "/build-native":
-            op = get_op("native")
-            if op.status == "building":
+            op = try_reserve_op("native")
+            if op is None:
                 self._err("Build natif déjà en cours", 409); return
             payload = self._read_json_body()
             config  = payload.get("config", payload)
@@ -6430,8 +8897,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         # ── /build-twa : enveloppe un site existant via bubblewrap (TWA) ────
         if path == "/build-twa":
-            op = get_op("twa")
-            if op.status == "building":
+            op = try_reserve_op("twa")
+            if op is None:
                 self._err("Build TWA déjà en cours", 409); return
             payload = self._read_json_body()
             config  = payload.get("config", payload)
@@ -6450,9 +8917,130 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # ── /cordova-generate : génère le projet Cordova SANS compiler,
         # pour permettre l'édition dans l'explorer avant un /build-cordova
         # ultérieur avec {"session": sid} ────────────────────────────────
+        # ── NativeScript / MAUI / Titanium — pipelines BETA (voir
+        # commentaire en tête de section dans server.py). Même schéma que
+        # cordova-generate/build-cordova : générer sans compiler, puis
+        # compiler séparément (ou compiler direct sans session existante). ──
+        if path == "/nativescript-generate":
+            op = try_reserve_op("nativescript_gen")
+            if op is None:
+                self._err("Génération NativeScript déjà en cours", 409); return
+            payload = self._read_json_body()
+            config = payload.get("config", payload)
+            try:
+                icon_bytes = _safe_b64(payload.get("icon"), "icon")
+                site_zip_bytes = _safe_b64(payload.get("siteZip"), "siteZip")
+            except ValueError as e:
+                self._err(str(e), 400); return
+            def _run():
+                sid = new_session_id()
+                op.session = sid
+                try:
+                    generate_nativescript_project(sid, config, icon_bytes, site_zip_bytes, op)
+                    op.status = "done"
+                except Exception as e:
+                    op.log(f"❌ Erreur: {e}")
+                    op.status = "error"
+            threading.Thread(target=_run, daemon=True).start()
+            self._json({"started": True, "session": "nativescript_gen"})
+            return
+
+        if path == "/build-nativescript":
+            op = try_reserve_op("nativescript")
+            if op is None:
+                self._err("Build NativeScript déjà en cours", 409); return
+            payload = self._read_json_body()
+            config = payload.get("config", payload)
+            try:
+                icon_bytes = _safe_b64(payload.get("icon"), "icon")
+                site_zip_bytes = _safe_b64(payload.get("siteZip"), "siteZip")
+            except ValueError as e:
+                self._err(str(e), 400); return
+            threading.Thread(target=do_build_nativescript, args=(config, icon_bytes, None, site_zip_bytes), daemon=True).start()
+            self._json({"started": True, "session": "nativescript"})
+            return
+
+        if path == "/maui-generate":
+            op = try_reserve_op("maui_gen")
+            if op is None:
+                self._err("Génération MAUI déjà en cours", 409); return
+            payload = self._read_json_body()
+            config = payload.get("config", payload)
+            try:
+                icon_bytes = _safe_b64(payload.get("icon"), "icon")
+                site_zip_bytes = _safe_b64(payload.get("siteZip"), "siteZip")
+            except ValueError as e:
+                self._err(str(e), 400); return
+            def _run():
+                sid = new_session_id()
+                op.session = sid
+                try:
+                    generate_maui_project(sid, config, icon_bytes, site_zip_bytes, op)
+                    op.status = "done"
+                except Exception as e:
+                    op.log(f"❌ Erreur: {e}")
+                    op.status = "error"
+            threading.Thread(target=_run, daemon=True).start()
+            self._json({"started": True, "session": "maui_gen"})
+            return
+
+        if path == "/build-maui":
+            op = try_reserve_op("maui")
+            if op is None:
+                self._err("Build MAUI déjà en cours", 409); return
+            payload = self._read_json_body()
+            config = payload.get("config", payload)
+            try:
+                icon_bytes = _safe_b64(payload.get("icon"), "icon")
+                site_zip_bytes = _safe_b64(payload.get("siteZip"), "siteZip")
+            except ValueError as e:
+                self._err(str(e), 400); return
+            threading.Thread(target=do_build_maui, args=(config, icon_bytes, None, site_zip_bytes), daemon=True).start()
+            self._json({"started": True, "session": "maui"})
+            return
+
+        if path == "/titanium-generate":
+            op = try_reserve_op("titanium_gen")
+            if op is None:
+                self._err("Génération Titanium déjà en cours", 409); return
+            payload = self._read_json_body()
+            config = payload.get("config", payload)
+            try:
+                icon_bytes = _safe_b64(payload.get("icon"), "icon")
+                site_zip_bytes = _safe_b64(payload.get("siteZip"), "siteZip")
+            except ValueError as e:
+                self._err(str(e), 400); return
+            def _run():
+                sid = new_session_id()
+                op.session = sid
+                try:
+                    generate_titanium_project(sid, config, icon_bytes, site_zip_bytes, op)
+                    op.status = "done"
+                except Exception as e:
+                    op.log(f"❌ Erreur: {e}")
+                    op.status = "error"
+            threading.Thread(target=_run, daemon=True).start()
+            self._json({"started": True, "session": "titanium_gen"})
+            return
+
+        if path == "/build-titanium":
+            op = try_reserve_op("titanium")
+            if op is None:
+                self._err("Build Titanium déjà en cours", 409); return
+            payload = self._read_json_body()
+            config = payload.get("config", payload)
+            try:
+                icon_bytes = _safe_b64(payload.get("icon"), "icon")
+                site_zip_bytes = _safe_b64(payload.get("siteZip"), "siteZip")
+            except ValueError as e:
+                self._err(str(e), 400); return
+            threading.Thread(target=do_build_titanium, args=(config, icon_bytes, None, site_zip_bytes), daemon=True).start()
+            self._json({"started": True, "session": "titanium"})
+            return
+
         if path == "/cordova-generate":
-            op = get_op("cordova_gen")
-            if op.status == "building":
+            op = try_reserve_op("cordova_gen")
+            if op is None:
                 self._err("Génération Cordova déjà en cours", 409); return
             payload = self._read_json_body()
             config  = payload.get("config", payload)
@@ -6474,8 +9062,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # ── /flutter-generate : génère le projet Flutter SANS compiler ──
         # (url / scratch / template — voir config.sourceMode)
         if path == "/flutter-generate":
-            op = get_op("flutter_gen")
-            if op.status == "building":
+            op = try_reserve_op("flutter_gen")
+            if op is None:
                 self._err("Génération Flutter déjà en cours", 409); return
             payload = self._read_json_body()
             config  = payload.get("config", payload)
@@ -6497,8 +9085,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # ── /rn-generate : génère le projet React Native SANS compiler ──
         # (url / scratch / template — voir config.sourceMode)
         if path == "/rn-generate":
-            op = get_op("rn_gen")
-            if op.status == "building":
+            op = try_reserve_op("rn_gen")
+            if op is None:
                 self._err("Génération React Native déjà en cours", 409); return
             payload = self._read_json_body()
             config  = payload.get("config", payload)
@@ -6520,8 +9108,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # ── /build-cordova : enveloppe un site dans un vrai projet Cordova ──
         # (url / scratch / template — voir config.sourceMode)
         if path == "/build-cordova":
-            op = get_op("cordova")
-            if op.status == "building":
+            op = try_reserve_op("cordova")
+            if op is None:
                 self._err("Build Cordova déjà en cours", 409); return
             payload = self._read_json_body()
             config  = payload.get("config", payload)
@@ -6543,8 +9131,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # ── /build-flutter : enveloppe un site dans un vrai projet Flutter ──
         # (url / scratch / template — voir config.sourceMode)
         if path == "/build-flutter":
-            op = get_op("flutter")
-            if op.status == "building":
+            op = try_reserve_op("flutter")
+            if op is None:
                 self._err("Build Flutter déjà en cours", 409); return
             payload = self._read_json_body()
             config  = payload.get("config", payload)
@@ -6566,8 +9154,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # ── /build-rn : enveloppe un site dans un vrai projet React Native ──
         # (url / scratch / template — voir config.sourceMode)
         if path == "/build-rn":
-            op = get_op("rn")
-            if op.status == "building":
+            op = try_reserve_op("rn")
+            if op is None:
                 self._err("Build React Native déjà en cours", 409); return
             payload = self._read_json_body()
             config  = payload.get("config", payload)
@@ -6589,8 +9177,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # ── /jadx-decompile : décompile un APK uploadé en sources Java ──────
         # lisibles (jadx), indépendant des autres pipelines (token OPS 'jadx').
         if path == "/jadx-decompile":
-            op = get_op("jadx")
-            if op.status == "building":
+            op = try_reserve_op("jadx")
+            if op is None:
                 self._err("Décompilation jadx déjà en cours", 409); return
             payload = self._read_json_body()
             apk_b64 = payload.get("apk")
@@ -6610,8 +9198,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         # ── /build : génère APK depuis template OU from scratch ─────────────
         if path == "/build":
-            op = OPS["legacy"]
-            if op.status == "building":
+            op = try_reserve_op("legacy")
+            if op is None:
                 self._err("Build déjà en cours", 409); return
             payload        = self._read_json_body()
             config         = payload.get("config", payload)
@@ -6633,13 +9221,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         # ── /import : décompile un APK uploadé (Mode Dev) ───────────────────
         if path == "/import":
-            op = OPS["legacy"]
-            if op.status == "building":
+            op = try_reserve_op("legacy")
+            if op is None:
                 self._err("Décompilation déjà en cours", 409); return
             payload    = self._read_json_body()
             apk_b64    = payload.get("apk") or payload.get("templateApk")
             tmpl_bytes = base64.b64decode(apk_b64) if apk_b64 else None
-            op.lines = []; op.status = "building"; op.result_file = None; op.session = None
+            op.session = None
 
             def _do_import():
                 global CURRENT_SESSION
@@ -6656,15 +9244,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         # ── /create-scratch-session : crée une session source sans template ──
         if path == "/create-scratch-session":
-            op = OPS["legacy"]
-            if op.status == "building":
+            op = try_reserve_op("legacy")
+            if op is None:
                 self._err("Opération déjà en cours", 409); return
             payload = self._read_json_body()
             config        = payload.get("config", payload)
             icon_bytes    = base64.b64decode(payload["icon"])    if payload.get("icon")    else None
             splash_bytes  = base64.b64decode(payload["splash"])  if payload.get("splash")  else None
             site_zip_bytes= base64.b64decode(payload["siteZip"]) if payload.get("siteZip") else None
-            op.lines = []; op.status = "building"; op.result_file = None; op.session = None
+            op.session = None
 
             def _do_create():
                 global CURRENT_SESSION
@@ -6683,15 +9271,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/apply":
             if not CURRENT_SESSION:
                 self._err("Aucun projet chargé", 400); return
-            op = OPS["legacy"]
-            if op.status == "building":
+            op = try_reserve_op("legacy")
+            if op is None:
                 self._err("Opération déjà en cours", 409); return
             payload = self._read_json_body()
             config        = payload.get("config", payload)
             icon_bytes    = base64.b64decode(payload["icon"])    if payload.get("icon")    else None
             splash_bytes  = base64.b64decode(payload["splash"])  if payload.get("splash")  else None
             site_zip_bytes= base64.b64decode(payload["siteZip"]) if payload.get("siteZip") else None
-            op.lines = []; op.status = "building"; op.result_file = None
             sid_snap = CURRENT_SESSION
 
             def _do_apply():
@@ -6710,14 +9297,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/recompile":
             if not CURRENT_SESSION:
                 self._err("Aucun projet chargé", 400); return
-            op = OPS["legacy"]
-            if op.status == "building":
+            op = try_reserve_op("legacy")
+            if op is None:
                 self._err("Opération déjà en cours", 409); return
             payload = self._read_json_body()
             signing  = payload.get("signing",  {"mode": "debug"})
             out_name = payload.get("outName",  "output.apk")
             sid_snap = CURRENT_SESSION
-            op.lines = []; op.status = "building"; op.result_file = None
 
             def _do_recompile():
                 try:
@@ -6749,7 +9335,38 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not sid: self._err("Aucun projet chargé", 400); return
             try:
                 write_file_safe(sid, rel, content)
-                self._json({"saved": rel})
+                # Filet de sécurité temps réel : si ce fichier vient d'être
+                # écrit dans le mauvais dossier racine pour le type réel de
+                # CETTE session (ex: assets/app.js dans une session cordova
+                # dont la racine active est www/), enforce_project_entrypoint
+                # le détecte et nettoie tout de suite, au lieu d'attendre le
+                # prochain build. On ne bloque jamais la réponse à cause de
+                # ce nettoyage : un souci ici reste non-bloquant et n'empêche
+                # pas la confirmation d'écriture.
+                try:
+                    entry_report = enforce_project_entrypoint(sid, kind_hint=_session_origin(sid) or None)
+                except Exception:
+                    entry_report = None
+                resp = {"saved": rel}
+                if entry_report: resp["entrypoint"] = entry_report
+                self._json(resp)
+            except Exception as e:
+                self._err(e, 500)
+            return
+
+        # ── /cleanup-mismatched-files : répare une session déjà polluée par
+        # le bug "fichiers d'un autre framework écrits dans cette session"
+        # (ex: pubspec.yaml/*.dart écrits dans une session scratch avant
+        # que le garde-fou write_file_safe ne couvre ce cas). Supprime
+        # UNIQUEMENT les fichiers marqueurs d'un AUTRE framework que
+        # l'origin réel de la session — jamais les fichiers du bon type.
+        if path == "/cleanup-mismatched-files":
+            payload = self._read_json_body()
+            sid = payload.get("session") or CURRENT_SESSION
+            if not sid: self._err("Aucun projet chargé", 400); return
+            try:
+                removed = cleanup_mismatched_framework_files(sid)
+                self._json({"session": sid, "removed": removed, "count": len(removed)})
             except Exception as e:
                 self._err(e, 500)
             return
@@ -7028,11 +9645,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     if not apksigner:
                         logger.log("⚠ apksigner introuvable — tentative de téléchargement du SDK Android...")
                         try:
-                            import urllib.request, zipfile as _zf, tempfile as _tmp
-                            sdk_url = "https://dl.google.com/android/repository/commandlinetools-win-11076708_latest.zip"
+                            import zipfile as _zf
+                            sdk_urls = [
+                                "https://dl.google.com/android/repository/commandlinetools-win-11076708_latest.zip",
+                                "https://dl.google.com/android/repository/commandlinetools-win-10406996_latest.zip",
+                            ]
                             sdk_zip = TOOLS_DIR / "cmdline-tools.zip"
                             logger.log("📥 Téléchargement SDK Android command-line tools (~100 Mo)...")
-                            urllib.request.urlretrieve(sdk_url, sdk_zip)
+                            _download_with_fallback(sdk_urls, sdk_zip, logger)
                             if sdk_zip.exists() and sdk_zip.stat().st_size > 10000:
                                 extract_dest = SDK_DIR / "cmdline-tools"
                                 extract_dest.mkdir(parents=True, exist_ok=True)

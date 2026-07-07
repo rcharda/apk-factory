@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Allô Livreur</title>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Poppins:wght@700;800&display=swap" rel="stylesheet">
+<style>
+:root{
+  --primary:#F97316;--primary-dark:#C2410C;--primary-light:#FFF7ED;
+  --text3:#A8A69F;
+  --font:'Inter',sans-serif;--font-display:'Poppins',sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0;}
+html,body{height:100%;}
+body{
+  font-family:var(--font);
+  background:#1A1A18;
+  color:#fff;
+  height:100vh;
+  width:100vw;
+  overflow:hidden;
+  display:flex;
+  flex-direction:column;
+  align-items:center;
+  justify-content:center;
+  gap:1.5rem;
+  position:relative;
+}
+.bg-glow{
+  position:absolute;inset:0;
+  background:
+    radial-gradient(circle at 20% 20%, rgba(249,115,22,.18), transparent 45%),
+    radial-gradient(circle at 80% 85%, rgba(249,115,22,.12), transparent 50%);
+  pointer-events:none;
+}
+.logo-wrap{display:flex;flex-direction:column;align-items:center;gap:1.1rem;z-index:1;animation:fadeUp .7s ease both;}
+.logo-icon{
+  width:84px;height:84px;border-radius:24px;
+  background:linear-gradient(145deg,var(--primary),var(--primary-dark));
+  display:flex;align-items:center;justify-content:center;
+  box-shadow:0 10px 30px rgba(249,115,22,.35);
+  animation:pulse 1.8s ease-in-out infinite;
+}
+.logo-icon svg{width:44px;height:44px;}
+.logo-txt{font-family:var(--font-display);font-size:1.7rem;font-weight:800;letter-spacing:-.5px;color:#fff;}
+.logo-txt span{color:var(--primary);}
+.tagline{font-size:.82rem;color:#A8A69F;font-weight:500;letter-spacing:.3px;margin-top:-.6rem;}
+.progress-wrap{width:180px;height:4px;background:rgba(255,255,255,.12);border-radius:50px;overflow:hidden;z-index:1;}
+.progress-bar{height:100%;width:40%;border-radius:50px;background:linear-gradient(90deg,var(--primary),#FDBA74);animation:loading 1.3s ease-in-out infinite;}
+#status-txt{font-size:.78rem;color:var(--text3);z-index:1;min-height:1.1em;transition:opacity .2s;text-align:center;padding:0 2rem;}
+footer{position:absolute;bottom:1.6rem;font-size:.68rem;color:var(--text3);z-index:1;letter-spacing:.3px;}
+@keyframes pulse{0%,100%{transform:scale(1);box-shadow:0 10px 30px rgba(249,115,22,.35);}50%{transform:scale(1.06);box-shadow:0 14px 40px rgba(249,115,22,.5);}}
+@keyframes loading{0%{transform:translateX(-120%);width:40%;}50%{width:60%;}100%{transform:translateX(280%);width:40%;}}
+@keyframes fadeUp{from{opacity:0;transform:translateY(14px);}to{opacity:1;transform:translateY(0);}}
+
+/* Écran offline */
+#offline-screen{
+  position:fixed;inset:0;background:#1A1A18;display:none;
+  flex-direction:column;align-items:center;justify-content:center;gap:1rem;
+  z-index:20;padding:2rem;text-align:center;
+}
+#offline-screen .ic{font-size:2.4rem;}
+#offline-screen h3{font-family:var(--font-display);font-size:1.05rem;}
+#offline-screen p{font-size:.85rem;color:var(--text3);max-width:280px;}
+#offline-screen button{
+  margin-top:.5rem;padding:.7rem 1.6rem;background:var(--primary);color:#fff;
+  border:none;border-radius:50px;font-family:var(--font);font-weight:600;font-size:.85rem;cursor:pointer;
+}
+
+/* Écran erreur */
+#error-screen{
+  position:fixed;inset:0;background:#1A1A18;display:none;
+  flex-direction:column;align-items:center;justify-content:center;gap:1rem;
+  z-index:20;padding:2rem;text-align:center;
+}
+#error-screen .ic{font-size:2.4rem;}
+#error-screen h3{font-family:var(--font-display);font-size:1.05rem;}
+#error-screen p{font-size:.8rem;color:var(--text3);max-width:300px;}
+#error-screen button{
+  margin-top:.5rem;padding:.7rem 1.6rem;background:var(--primary);color:#fff;
+  border:none;border-radius:50px;font-family:var(--font);font-weight:600;font-size:.85rem;cursor:pointer;
+}
+</style>
+</head>
+<body>
+
+<div class="bg-glow"></div>
+
+<div class="logo-wrap">
+  <div class="logo-icon">
+    <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <path d="M3 13h11l-1.5-5H5.5L3 13z" stroke="#fff" stroke-width="1.6" stroke-linejoin="round"/>
+      <path d="M14 8h3.5l3 5v4H14V8z" stroke="#fff" stroke-width="1.6" stroke-linejoin="round"/>
+      <circle cx="7" cy="18" r="2" stroke="#fff" stroke-width="1.6"/>
+      <circle cx="17.5" cy="18" r="2" stroke="#fff" stroke-width="1.6"/>
+      <path d="M9 18h6.5" stroke="#fff" stroke-width="1.6"/>
+    </svg>
+  </div>
+  <div class="logo-txt">Allô<span>Livreur</span></div>
+  <div class="tagline">Votre livraison, en un clic</div>
+</div>
+
+<div class="progress-wrap"><div class="progress-bar"></div></div>
+<div id="status-txt">Chargement…</div>
+<footer>Cotonou · Bénin</footer>
+
+<!-- Écran offline -->
+<div id="offline-screen">
+  <div class="ic">📡</div>
+  <h3>Pas de connexion</h3>
+  <p>Vérifiez votre connexion internet puis réessayez.</p>
+  <button onclick="location.reload()">Réessayer</button>
+</div>
+
+<!-- Écran erreur -->
+<div id="error-screen">
+  <div class="ic">⚠️</div>
+  <h3>Erreur de chargement</h3>
+  <p id="error-msg">Une erreur est survenue. Réessayez.</p>
+  <button onclick="location.reload()">Réessayer</button>
+</div>
+
+<script>
+// ── CONFIG SUPABASE ─────────────────────────────────────
+const SUPABASE_URL='https://kathcclodsceifbyygzk.supabase.co';
+const SUPABASE_KEY='sb_publishable_9m78hZ7BUe9jYykJ1w3kZw_Q_yig4J3';
+const sb=supabase.createClient(SUPABASE_URL,SUPABASE_KEY);
+
+const APP_NAME='client';
+const LOCAL_VERSION_KEY='av_client_version';
+const LOCAL_HTML_KEY='av_client_html';
+
+const statusEl=document.getElementById('status-txt');
+function setStatus(txt){
+  statusEl.style.opacity=0;
+  setTimeout(()=>{statusEl.textContent=txt;statusEl.style.opacity=1;},150);
+}
+
+function showOffline(){document.getElementById('offline-screen').style.display='flex';}
+function showError(msg){
+  document.getElementById('error-msg').textContent=msg||'Une erreur est survenue. Réessayez.';
+  document.getElementById('error-screen').style.display='flex';
+}
+
+function _isStorageAvailable(){
+  try{const k='__t__';localStorage.setItem(k,'1');localStorage.removeItem(k);return true;}
+  catch(e){return false;}
+}
+const storageOk=_isStorageAvailable();
+
+async function boot(){
+  if(!navigator.onLine){
+    const cached=storageOk?localStorage.getItem(LOCAL_HTML_KEY):null;
+    if(cached){
+      setStatus('Mode hors-ligne — version locale…');
+      setTimeout(()=>launchApp(cached),600);
+    } else {
+      showOffline();
+    }
+    return;
+  }
+
+  setStatus('Vérification des mises à jour…');
+
+  try{
+    const {data,error}=await sb
+      .from('app_versions')
+      .select('*')
+      .eq('app_name',APP_NAME)
+      .single();
+
+    if(error||!data||!data.html_content){
+      const cached=storageOk?localStorage.getItem(LOCAL_HTML_KEY):null;
+      if(cached){
+        setStatus('Chargement…');
+        setTimeout(()=>launchApp(cached),400);
+      } else {
+        showError("Aucune version de l'application n'est disponible pour le moment.");
+      }
+      return;
+    }
+
+    const remoteVersion=data.version;
+    const localVersion=storageOk?localStorage.getItem(LOCAL_VERSION_KEY):null;
+
+    if(remoteVersion===localVersion && storageOk && localStorage.getItem(LOCAL_HTML_KEY)){
+      setStatus('Chargement…');
+      setTimeout(()=>launchApp(localStorage.getItem(LOCAL_HTML_KEY)),400);
+    } else {
+      setStatus(localVersion?`Mise à jour vers ${remoteVersion}…`:'Préparation de votre espace…');
+      if(storageOk){
+        try{
+          localStorage.setItem(LOCAL_HTML_KEY,data.html_content);
+          localStorage.setItem(LOCAL_VERSION_KEY,remoteVersion);
+        }catch(e){
+          console.warn('Stockage local impossible (quota ?)',e);
+        }
+      }
+      setTimeout(()=>launchApp(data.html_content),500);
+    }
+  }catch(e){
+    console.error(e);
+    const cached=storageOk?localStorage.getItem(LOCAL_HTML_KEY):null;
+    if(cached){
+      setStatus('Chargement…');
+      setTimeout(()=>launchApp(cached),400);
+    } else {
+      showError('Impossible de contacter le serveur. Vérifiez votre connexion.');
+    }
+  }
+}
+
+function launchApp(htmlContent){
+  try{
+    if(storageOk){
+      localStorage.setItem(LOCAL_HTML_KEY,htmlContent);
+    } else {
+      // Pas de stockage possible : on passe le contenu via sessionStorage en dernier recours
+      try{sessionStorage.setItem(LOCAL_HTML_KEY,htmlContent);}catch(e){}
+    }
+    // Vraie navigation (même origine) : les permissions (micro/GPS) et le contexte JS
+    // restent propres, sans conflit avec les variables déjà déclarées ici.
+    window.location.href='shell.html';
+  }catch(e){
+    console.error('Erreur lors du lancement de l\'app',e);
+    showError('Impossible de charger l\'application. Réessayez.');
+  }
+}
+
+window.addEventListener('online', ()=>{document.getElementById('offline-screen').style.display='none';boot();});
+
+boot();
+</script>
+
+</body>
+</html>

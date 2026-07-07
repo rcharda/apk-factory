@@ -1,115 +1,82 @@
 {
   "name": "apk-factory-pro",
   "version": "3.0.0",
-  "description": "APK Factory Pro",
+  "description": "APK Factory Pro — génère et édite des APK Android (WebView, Cordova, Flutter, React Native, TWA, Natif) avec assistance IA.",
   "main": "main.js",
-  "author": "APK Factory",
+  "author": "GBOHOUNME Richard Chiriaque",
+  "license": "UNLICENSED",
   "private": true,
   "scripts": {
     "start": "electron .",
+    "pack": "electron-builder --dir",
     "build": "electron-builder --win",
-    "build:installer": "electron-builder --win nsis",
-    "build:portable": "electron-builder --win portable"
+    "build:portable": "electron-builder --win portable",
+    "publish": "electron-builder --win --publish always"
+  },
+  "dependencies": {
+    "electron-log": "^5.4.4",
+    "electron-updater": "^6.8.9"
   },
   "devDependencies": {
     "electron": "^31.7.7",
     "electron-builder": "^24.13.3"
   },
   "build": {
-    "appId": "com.apkfactory.pro",
-    "productName": "APK Factory Pro",
-    "copyright": "APK Factory Pro",
-    "directories": {
-      "output": "../dist_electron",
-      "buildResources": "build_res"
-    },
+    "appId": "com.apkfactorypro.app",
+    "productName": "APK Factory Pro v3",
+    "asar": true,
+
     "files": [
       "main.js",
       "preload.js",
       "setup.js",
-      "package.json"
+      "agent-engine.js",
+      "iareparateur.js",
+      "package.json",
+      "keystore-setup.html",
+      "keystore-preload.js",
+      "!**/*.map"
     ],
+
     "extraResources": [
-      {
-        "from": "server.py",
-        "to": "server.py"
-      },
-      {
-        "from": "builder.html",
-        "to": "builder.html"
-      },
-      {
-        "from": "license.html",
-        "to": "license.html"
-      },
-      {
-        "from": "license-renderer.js",
-        "to": "license-renderer.js"
-      },
-      {
-        "from": "tools",
-        "to": "tools",
-        "filter": [
-          "**/*",
-          "!android-sdk/build-tools/34.0.0/renderscript/**"
-        ]
-      },
-      {
-        "from": "output",
-        "to": "output",
-        "filter": [
-          "**/*"
-        ]
-      },
-      {
-        "from": "workspace",
-        "to": "workspace",
-        "filter": [
-          "*.apk",
-          "*.bat"
-        ]
-      }
+      { "from": "server.py", "to": "server.py" },
+      { "from": "builder.html", "to": "builder.html" },
+      { "from": "license.html", "to": "license.html" },
+      { "from": "license-renderer.js", "to": "license-renderer.js" },
+      { "from": "templates", "to": "templates" },
+      { "from": "assets/icon.ico", "to": "icon.ico" },
+      { "from": "tools/apktool.jar", "to": "tools/apktool.jar" },
+      { "from": "tools/apktool.bat", "to": "tools/apktool.bat" },
+      { "from": "tools/debug.keystore", "to": "tools/debug.keystore" },
+      { "from": "tools/android-sdk", "to": "tools/android-sdk", "filter": ["build-tools/**/*"] }
     ],
+
     "win": {
       "target": [
-        {
-          "target": "nsis",
-          "arch": [
-            "x64"
-          ]
-        },
-        {
-          "target": "portable",
-          "arch": [
-            "x64"
-          ]
-        }
+        { "target": "nsis", "arch": ["x64"] },
+        { "target": "portable", "arch": ["x64"] }
       ],
-      "requestedExecutionLevel": "asInvoker",
       "icon": "assets/icon.ico"
     },
+
     "nsis": {
+      "artifactName": "${productName}-${version}-installer-${arch}.${ext}",
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "APK Factory Pro",
-      "deleteAppDataOnUninstall": false,
-      "installerIcon": "assets/icon.ico",
-      "installerHeaderIcon": "assets/icon.ico",
-      "uninstallerIcon": "assets/icon.ico",
-      "multiLanguageInstaller": false,
-      "installerLanguages": ["en_US"]
+      "shortcutName": "APK Factory Pro v3",
+      "include": "installer.nsh"
     },
-    "compression": "normal",
+
+    "portable": {
+      "artifactName": "${productName}-${version}-portable-${arch}.${ext}"
+    },
+
     "publish": {
       "provider": "github",
-      "owner": "rcharda",
-      "repo": "apk-factory"
+      "owner": "TON-PSEUDO-GITHUB",
+      "repo": "apk-factory-pro"
     }
-  },
-  "dependencies": {
-    "electron-log": "^5.4.4",
-    "electron-updater": "^6.8.9"
   }
 }

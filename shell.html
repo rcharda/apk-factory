@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"></head>
+<body>
+<script>
+// Ce fichier est une coquille minimale : il ne déclare aucune variable
+// susceptible d'entrer en conflit avec le code de l'app client.
+// Le document.write() ci-dessous est appelé de façon synchrone, pendant
+// l'analyse initiale de la page (avant l'événement "load") : c'est la
+// condition pour que les navigateurs l'exécutent normalement, sans bloquer
+// les scripts externes (contrairement à un document.write() appelé après
+// chargement complet d'une page, qui est bridé par les navigateurs).
+(function(){
+  var html = null;
+  try{ html = localStorage.getItem('av_client_html'); }catch(e){}
+  if(!html){
+    try{ html = sessionStorage.getItem('av_client_html'); }catch(e){}
+  }
+  if(!html){
+    document.write('<p style="font-family:sans-serif;text-align:center;margin-top:3rem;color:#666">Erreur : aucune application en cache. <a href="loader.html">Recharger</a></p>');
+    return;
+  }
+  document.open();
+  document.write(html);
+  document.close();
+})();
+</script>
+</body>
+</html>

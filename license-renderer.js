@@ -15,6 +15,20 @@ let selectedPlanId = null;
 let pollInterval = null;
 let lastPaymentUrl = null;
 
+// ── fetch() avec timeout obligatoire ────────────────────────────────────────
+// AUCUN fetch nu dans ce fichier : sans timeout, un réseau qui bloque en
+// silence (pare-feu d'entreprise, Wi-Fi captif, DNS qui ne répond jamais...)
+// laisse la promesse en attente indéfiniment — l'écran reste alors figé sur
+// "Vérification de la licence…" pour toujours, sans aucune erreur affichée.
+// Avec AbortController, on force un échec propre après quelques secondes,
+// ce qui retombe sur les messages d'erreur déjà prévus ("connexion instable",
+// "impossible de vérifier"...) au lieu d'un blocage muet.
+function fetchWithTimeout(url, options = {}, timeoutMs = 10000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  return fetch(url, { ...options, signal: controller.signal }).finally(() => clearTimeout(timer));
+}
+
 // ── Format de la clé de licence ─────────────────────────────────────────────
 // 10 caractères, alphabet réduit pour éviter les confusions à la recopie
 // (pas de 0/O, pas de 1/I/L). Affichée à l'écran avec un tiret au milieu
@@ -78,7 +92,7 @@ function showConfirmModal(message) {
 // verrouillage reste device_id.
 async function getPublicIp() {
   try {
-    const r = await fetch("https://api.ipify.org?format=json");
+    const r = await fetchWithTimeout("https://api.ipify.org?format=json", {}, 5000);
     if (!r.ok) return null;
     const d = await r.json();
     return d.ip || null;
@@ -205,7 +219,7 @@ function resetBtn(btn) {
 // Toutes les requêtes Supabase passent par la clé anon : il n'y a plus de
 // jeton utilisateur (pas de compte, pas de Supabase Auth).
 async function supabaseFetch(path, options = {}) {
-  return fetch(`${SUPABASE_URL}${path}`, {
+  return fetchWithTimeout(`${SUPABASE_URL}${path}`, {
     ...options,
     headers: {
       "apikey": SUPABASE_ANON_KEY,
@@ -213,7 +227,7 @@ async function supabaseFetch(path, options = {}) {
       "Content-Type": "application/json",
       ...(options.headers || {}),
     },
-  });
+  }, 10000);
 }
 
 // ── Récupère une licence par sa clé, quel que soit son statut ──────────────

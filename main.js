@@ -6,6 +6,7 @@ const fs = require('fs');
 const crypto = require('crypto');
 const http = require('http');
 const setupManager = require('./setup.js');
+const iaReparateur = require('./iareparateur.js');
 
 const PORT = 7842;
 let mainWindow = null;
@@ -228,12 +229,73 @@ function startDeviceHeartbeat(licenseKey) {
 // de référence, mais on ne dépend pas de sa persistance).
 const RELEASE_KS_META_FILE = () => path.join(app.getPath('userData'), 'release-keystore.json');
 
-function readReleaseKeystoreMeta() {
-  try { return JSON.parse(fs.readFileSync(RELEASE_KS_META_FILE(), 'utf-8')); } catch (e) { return null; }
+// ---------------------------------------------------------------------
+// MULTI-KEYSTORE : le fichier stockait à l'origine UN SEUL keystore global
+// (un objet unique, écrasé à chaque génération/import). Or agent-engine.js
+// (resolveSigningKey) est conçu pour PLUSIEURS clés — une par app/package,
+// avec réutilisation possible d'une clé existante — via
+// window.electronAPI.releaseKeystoreList(), qui n'existait nulle part.
+//
+// Nouveau format sur disque : { keystores: [ { id, alias, ksName, dname,
+// encStorePass, encKeyPass, keystoreB64, createdAt, source }, ... ] }
+// id = "default" (première clé jamais créée sur la machine) ou le
+// packageName de l'app pour une "signature dédiée" (voir agent-engine.js,
+// resolveSigningKey → finalKey = pkg).
+//
+// Rétrocompatibilité : si le fichier existant est encore l'ancien objet
+// unique (repérable par la présence de "ksName" à la racine), on le migre
+// automatiquement en { keystores: [{ id: 'default', ...ancienObjet }] }
+// et on réécrit le fichier dans le nouveau format dès la première lecture.
+// ---------------------------------------------------------------------
+function readKeystoreStore() {
+  let raw;
+  try { raw = JSON.parse(fs.readFileSync(RELEASE_KS_META_FILE(), 'utf-8')); }
+  catch (e) { return { keystores: [] }; }
+
+  if (raw && Array.isArray(raw.keystores)) return raw;
+
+  // Ancien format (objet unique à la racine) → migration silencieuse.
+  if (raw && raw.ksName) {
+    const migrated = { keystores: [{ id: 'default', ...raw }] };
+    try { writeKeystoreStore(migrated); } catch { /* pas bloquant, on retentera au prochain write */ }
+    return migrated;
+  }
+
+  return { keystores: [] };
 }
-function writeReleaseKeystoreMeta(meta) {
-  fs.writeFileSync(RELEASE_KS_META_FILE(), JSON.stringify(meta));
+
+function writeKeystoreStore(store) {
+  fs.writeFileSync(RELEASE_KS_META_FILE(), JSON.stringify(store));
 }
+
+function findKeystoreEntry(id) {
+  const store = readKeystoreStore();
+  if (!store.keystores.length) return null;
+  const wanted = id || 'default';
+  return store.keystores.find((k) => k.id === wanted) || null;
+}
+
+// Ajoute (ou remplace, si le même id existe déjà — ex: régénération
+// volontaire) une entrée dans la liste, sans toucher aux autres clés.
+function upsertKeystoreEntry(id, fields) {
+  const store = readKeystoreStore();
+  const finalId = id || 'default';
+  const idx = store.keystores.findIndex((k) => k.id === finalId);
+  const entry = { id: finalId, ...fields };
+  if (idx >= 0) store.keystores[idx] = entry;
+  else store.keystores.push(entry);
+  writeKeystoreStore(store);
+  return entry;
+}
+
+// Conservées pour compatibilité avec le code existant qui ne raisonnait
+// qu'en "la" clé (ex: valeur par défaut avant que keystoreKey ne soit
+// branché) — retombent désormais sur l'entrée 'default' ou, à défaut,
+// la première clé connue.
+function readReleaseKeystoreMeta(id) {
+  return findKeystoreEntry(id) || readKeystoreStore().keystores[0] || null;
+}
+
 function decryptReleasePasswords(meta) {
   if (!safeStorage.isEncryptionAvailable()) {
     throw new Error(
@@ -247,10 +309,26 @@ function decryptReleasePasswords(meta) {
   };
 }
 
+// Liste des clés de signature existantes — c'est CE handler qui manquait
+// et que agent-engine.js appelait déjà en aveugle (protégé par un
+// typeof === 'function', donc aucun crash, mais la fonctionnalité de choix
+// "réutiliser vs créer" ne se déclenchait jamais). Le champ `key` correspond
+// à l'`id` interne (utilisé ensuite comme `keystoreKey` par buildWithReleaseSigning).
+ipcMain.handle('release-keystore-list', () => {
+  const store = readKeystoreStore();
+  return store.keystores.map((k) => ({
+    key: k.id,
+    alias: k.alias,
+    createdAt: k.createdAt,
+    source: k.source,
+  }));
+});
+
 ipcMain.handle('release-keystore-status', () => {
-  const meta = readReleaseKeystoreMeta();
-  if (!meta) return { configured: false };
-  return { configured: true, alias: meta.alias, createdAt: meta.createdAt, source: meta.source };
+  const store = readKeystoreStore();
+  if (!store.keystores.length) return { configured: false, count: 0 };
+  const meta = store.keystores[0];
+  return { configured: true, count: store.keystores.length, alias: meta.alias, createdAt: meta.createdAt, source: meta.source };
 });
 
 // Interroge une opération asynchrone du serveur Python local (même logique
@@ -277,8 +355,14 @@ async function pollLocalOp(token, { timeoutMs = 30000, intervalMs = 800 } = {}) 
 // saisir un mot de passe de production.
 let keystoreSetupWindow = null;
 let keystoreSetupResolve = null;
+// Id sous lequel la PROCHAINE génération/import (keystore-setup-generate /
+// keystore-setup-import) doit être enregistrée. Positionné juste avant
+// d'ouvrir la fenêtre par openKeystoreSetupWindow(id) — 'default' si aucun
+// id explicite (comportement historique inchangé pour la toute première clé).
+let pendingKeystoreId = 'default';
 
-function openKeystoreSetupWindow() {
+function openKeystoreSetupWindow(id) {
+  pendingKeystoreId = id || 'default';
   if (keystoreSetupWindow) {
     keystoreSetupWindow.focus();
     return new Promise((resolve) => { keystoreSetupResolve = resolve; });
@@ -306,7 +390,7 @@ function openKeystoreSetupWindow() {
     keystoreSetupWindow.on('closed', () => {
       keystoreSetupWindow = null;
       if (keystoreSetupResolve) {
-        const meta = readReleaseKeystoreMeta();
+        const meta = findKeystoreEntry(pendingKeystoreId);
         keystoreSetupResolve(meta ? { configured: true, alias: meta.alias } : { configured: false, cancelled: true });
         keystoreSetupResolve = null;
       }
@@ -335,7 +419,15 @@ ipcMain.handle('keystore-setup-generate', async (event, { alias, appName }) => {
     const keyPass = storePass; // keystore PKCS12 (create_keystore_python) : un seul mot de passe pour le store et la clé
     const safeCn = (appName || 'App').replace(/[,=]/g, ' ').trim() || 'App';
     const dname = `CN=${safeCn},O=APK Factory,C=BJ`;
-    const ksName = 'apk_factory_pro_release.keystore';
+    // BUG CORRIGÉ (multi-keystore) : le nom de fichier keystore côté serveur
+    // Python était TOUJOURS le même littéral ('apk_factory_pro_release.keystore'),
+    // quelle que soit l'app. Dès la 2e "signature dédiée" créée pour un
+    // package différent, /create-keystore retombait sur le même fichier
+    // déjà écrit avec un AUTRE mot de passe → erreur 'wrong_password' à
+    // chaque génération suivante. Le nom inclut maintenant l'id de la clé
+    // (pendingKeystoreId, ex: le packageName) pour rester unique par clé.
+    const idSlug = String(pendingKeystoreId || 'default').replace(/[^a-zA-Z0-9_-]+/g, '_').slice(0, 60);
+    const ksName = `apk_factory_pro_release_${idSlug}.keystore`;
 
     const startRes = await fetch(`http://127.0.0.1:${PORT}/create-keystore`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -355,7 +447,7 @@ ipcMain.handle('keystore-setup-generate', async (event, { alias, appName }) => {
       throw new Error(result.result?.message || 'Échec de la génération du keystore.');
     }
 
-    writeReleaseKeystoreMeta({
+    upsertKeystoreEntry(pendingKeystoreId, {
       ksName, alias: finalAlias, dname,
       encStorePass: safeStorage.encryptString(storePass).toString('base64'),
       encKeyPass: safeStorage.encryptString(keyPass).toString('base64'),
@@ -377,7 +469,7 @@ ipcMain.handle('keystore-setup-import', async (event, { filePath, alias, storePa
     if (!storePass) throw new Error('Mot de passe requis.');
     const bytes = fs.readFileSync(filePath);
 
-    writeReleaseKeystoreMeta({
+    upsertKeystoreEntry(pendingKeystoreId, {
       ksName: path.basename(filePath),
       alias: (alias || '').trim() || 'release',
       dname: null,
@@ -405,15 +497,23 @@ ipcMain.handle('keystore-setup-cancel', () => {
 // fait la requête HTTP vers le serveur Python local, après avoir injecté les
 // identifiants de signature déchiffrés dans body.config.signing. Le mot de
 // passe ne transite donc jamais par le contexte JS du renderer/agent.
-ipcMain.handle('build-with-release-signing', async (event, { endpoint, body }) => {
-  const meta = readReleaseKeystoreMeta();
-  if (!meta) {
-    const setupResult = await openKeystoreSetupWindow();
+ipcMain.handle('build-with-release-signing', async (event, { endpoint, body, keystoreKey }) => {
+  // BUG CORRIGÉ (multi-keystore) : keystoreKey était reçu par ce handler
+  // (preload.js le transmet déjà) mais totalement IGNORÉ — on retombait
+  // systématiquement sur readReleaseKeystoreMeta() sans id, donc toujours
+  // la même clé globale, quel que soit le choix fait dans resolveSigningKey()
+  // (agent-engine.js) entre "réutiliser une clé existante" et "signature
+  // dédiée". On cherche maintenant l'entrée précise correspondant à
+  // keystoreKey, et on ouvre la fenêtre de configuration POUR CET id
+  // précis si elle n'existe pas encore.
+  let finalMeta = findKeystoreEntry(keystoreKey);
+  if (!finalMeta) {
+    const setupResult = await openKeystoreSetupWindow(keystoreKey);
     if (!setupResult.configured) {
       return { needsSetup: true, cancelled: true, error: 'Configuration de la signature de production annulée par le client.' };
     }
+    finalMeta = findKeystoreEntry(keystoreKey);
   }
-  const finalMeta = readReleaseKeystoreMeta();
   if (!finalMeta) return { needsSetup: true, error: 'Configuration introuvable après la fenêtre de configuration.' };
 
   let passwords;
@@ -524,7 +624,8 @@ function testPythonCandidate(exe) {
 function findPython() {
   const attempts = [];
 
-  // En mode packagé, le python embarqué est toujours prioritaire si présent
+  // En mode packagé, le python embarqué "de base" livré avec l'installeur
+  // (s'il existe un jour dans extraResources) est prioritaire.
   if (app.isPackaged) {
     const embeddedPy = path.join(process.resourcesPath, 'python', 'python.exe');
     if (fs.existsSync(embeddedPy)) {
@@ -533,6 +634,22 @@ function findPython() {
       if (test.ok) return { exe: embeddedPy, attempts };
     }
   }
+
+  // BUG CORRIGÉ : le composant "python" de setup.js (installable depuis le
+  // modal Composants) télécharge Python dans setupManager.ROOT/python/
+  // (dossier utilisateur inscriptible), PAS dans resourcesPath/python (qui
+  // n'existe même pas — absent de extraResources). Sans ce check, un
+  // client qui installe "Python embarqué" via l'UI ne verrait jamais cet
+  // interpréteur utilisé : main.js retombait toujours sur le PATH système
+  // et échouait sur une machine sans Python préinstallé.
+  try {
+    const componentPy = path.join(setupManager.ROOT, 'python', 'python.exe');
+    if (fs.existsSync(componentPy)) {
+      const test = testPythonCandidate(componentPy);
+      attempts.push({ exe: componentPy, ...test });
+      if (test.ok) return { exe: componentPy, attempts };
+    }
+  } catch { /* setupManager.ROOT indisponible pour une raison quelconque */ }
 
   for (const exe of ['python', 'python3', 'py']) {
     const test = testPythonCandidate(exe);
@@ -588,7 +705,18 @@ function startPythonServer() {
 
     pythonProcess = spawn(pythonExe, [serverScript], {
       cwd: app.isPackaged ? process.resourcesPath : path.dirname(serverScript),
-      env: { ...process.env, PYTHONUNBUFFERED: '1', PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' },
+      env: {
+        ...process.env,
+        PYTHONUNBUFFERED: '1',
+        PYTHONUTF8: '1',
+        PYTHONIOENCODING: 'utf-8',
+        // CRITIQUE : server.py doit lire les composants dans le MÊME
+        // dossier que celui où setup.js les installe réellement
+        // (resolveRoot() → userData/tools en packagé). Sans ça, server.py
+        // retombe sur BASE_DIR/tools (= resources/tools, en lecture seule)
+        // et ne trouve jamais rien de ce que setup.js vient d'installer.
+        APKF_TOOLS_DIR: setupManager.ROOT,
+      },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
@@ -673,12 +801,14 @@ function waitForServer(resolve, reject, attempts) {
 
 // ─── Créer la fenêtre principale ──────────────────────────────────────────────
 function createWindow() {
-  // BUG-icon01 — 'assets/icon.ico' n'existe pas dans le paquet distribué
-  // (resources/ ne contient pas de dossier assets/). Le fichier réel est
-  // à resources/tools/icon.ico. Avec l'ancien chemin, fs.existsSync() échouait
-  // silencieusement et la fenêtre s'ouvrait avec l'icône Electron par défaut.
+  // BUG-icon01 corrigé : 'resources/tools/icon.ico' n'est jamais copié —
+  // aucune entrée extraResources dans package.json ne le prévoit, donc
+  // fs.existsSync() échouait quand même silencieusement (icône Electron
+  // par défaut). On ajoute une entrée extraResources dédiée
+  // ({ "from": "assets/icon.ico", "to": "icon.ico" }) et on pointe ici
+  // directement vers resources/icon.ico (racine de resources, pas tools/).
   const iconPath = app.isPackaged
-    ? path.join(process.resourcesPath, 'tools', 'icon.ico')
+    ? path.join(process.resourcesPath, 'icon.ico')
     : path.join(__dirname, 'assets', 'icon.ico');
 
   mainWindow = new BrowserWindow({
@@ -966,6 +1096,223 @@ ipcMain.handle('setup-install-components', async (event, ids) => {
       mainWindow?.webContents.send('setup-progress', progress);
     });
     return { ok: true, results };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+
+// ─── IPC : vérifie si une version plus récente d'un composant (Gradle, jadx...)
+// est disponible sur GitHub que celle actuellement codée/installée ─────────
+ipcMain.handle('setup-check-component-updates', async () => {
+  try {
+    const updates = await setupManager.checkComponentUpdates();
+    return { ok: true, updates };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+
+// ─── IPC : réinstalle un composant déjà présent par-dessus l'existant,
+// pour appliquer une mise à jour détectée par setup-check-component-updates ──
+ipcMain.handle('setup-update-component', async (event, id) => {
+  if (!id) return { ok: false, error: 'Identifiant de composant manquant.' };
+  try {
+    await setupManager.updateComponent(id, (progress) => {
+      mainWindow?.webContents.send('setup-progress', progress);
+    });
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+
+// ─── IPC : composants trouvés par l'IA hors du registre connu ─────────────────
+// Recherche seule (lecture publique GitHub) — n'installe jamais rien.
+ipcMain.handle('setup-search-github-component', async (event, query) => {
+  try {
+    return await setupManager.searchGithubReleaseAsset(query);
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+
+// Installation d'un composant trouvé par l'IA — appelé UNIQUEMENT après que
+// le client a coché la case et confirmé la popup côté builder.html (voir
+// startComponentsInstall()) : jamais depuis l'IA elle-même.
+ipcMain.handle('setup-install-dynamic-component', async (event, def) => {
+  if (!def || !def.id || !def.url) {
+    return { ok: false, error: 'Définition de composant invalide.' };
+  }
+  try {
+    const result = await setupManager.installDynamicComponent(def, (progress) => {
+      mainWindow?.webContents.send('setup-progress', progress);
+    });
+    return { ok: true, ...result };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+
+// ─── IPC : IAReparateur — diagnostic + réparation automatique des pannes
+// système (JDK/SDK/apktool/Gradle/keystore) détectées dans un journal de
+// build/décompilation/signature. Appelé soit par le client (bouton "🩹
+// Réparer" dans l'UI), soit par l'agent IA lui-même via le tool
+// 'repair_system' (voir agent-engine.js) juste après l'échec d'un
+// build_project/decompile/sign, avant de redemander quoi que ce soit.
+ipcMain.handle('ia-repair-diagnose', (event, logText) => {
+  try {
+    return { ok: true, matched: iaReparateur.diagnose(logText) };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+
+ipcMain.handle('ia-repair-run', async (event, { logText, context } = {}) => {
+  try {
+    const result = await iaReparateur.repair(logText, context, (progress) => {
+      mainWindow?.webContents.send('setup-progress', progress);
+    });
+    return { ok: true, ...result };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+
+// ─── IPC : suggestions IA en attente (persistées dans installed-components.json)
+// Permet à builder.html de réafficher, dès l'ouverture de l'app, les
+// composants trouvés par l'IA lors d'une session précédente et pas encore
+// installés — sans ça une suggestion disparaissait au redémarrage.
+ipcMain.handle('setup-list-ai-suggestions', () => {
+  return setupManager.listAiSuggestions();
+});
+
+ipcMain.handle('setup-save-ai-suggestion', (event, def) => {
+  if (!def || !def.id) return { ok: false, error: 'Définition invalide.' };
+  setupManager.saveAiSuggestion(def);
+  return { ok: true };
+});
+
+ipcMain.handle('setup-remove-ai-suggestion', (event, id) => {
+  if (!id) return { ok: false, error: 'Identifiant manquant.' };
+  setupManager.removeAiSuggestion(id);
+  return { ok: true };
+});
+
+// ─── IPC : dernier résultat connu de vérification des mises à jour de
+// composants, pour affichage immédiat à l'ouverture (avant même qu'un
+// nouveau check réseau ne revienne, ou si le client est hors ligne).
+ipcMain.handle('setup-get-last-update-check', () => {
+  return setupManager.getLastUpdateCheck();
+});
+
+// ─── IPC : recherche dans de grandes banques d'API publiques pour ENRICHIR
+// les apps générées (libs Android, plugins Cordova, packages Flutter, apps
+// F-Droid de référence) — indépendant de setupManager/setup.js, car ce ne
+// sont pas des "composants de build" (Gradle, JDK...) mais des dépendances
+// de CODE que l'IA peut proposer d'ajouter au projet du client. Recherche
+// seule : n'écrit jamais rien tout seul, c'est add_dependency (agent-engine)
+// + write_file/replace_line qui insèrent réellement la ligne choisie dans
+// build.gradle / config.xml / pubspec.yaml après lecture du résultat.
+async function searchMavenCentral(query, limit) {
+  const url = `https://search.maven.org/solrsearch/select?q=${encodeURIComponent(query)}&rows=${limit}&wt=json`;
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`Maven Central a répondu ${r.status}`);
+  const data = await r.json();
+  const docs = (data.response && data.response.docs) || [];
+  return docs.map((d) => ({
+    source: 'maven',
+    id: `${d.g}:${d.a}`,
+    label: `${d.g}:${d.a}`,
+    version: d.latestVersion || d.v || null,
+    description: `Groupe ${d.g}`,
+    url: `https://search.maven.org/artifact/${d.g}/${d.a}`,
+    // Ligne prête à coller dans build.gradle (dependencies { ... })
+    gradleLine: d.latestVersion ? `implementation '${d.g}:${d.a}:${d.latestVersion}'` : null,
+  }));
+}
+
+async function searchNpmRegistry(query, limit) {
+  const url = `https://registry.npmjs.org/-/v1/search?text=${encodeURIComponent(query)}&size=${limit}`;
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`npm registry a répondu ${r.status}`);
+  const data = await r.json();
+  const objs = data.objects || [];
+  return objs.map((o) => ({
+    source: 'npm',
+    id: o.package.name,
+    label: `${o.package.name}@${o.package.version}`,
+    version: o.package.version,
+    description: o.package.description || '',
+    url: (o.package.links && o.package.links.npm) || `https://www.npmjs.com/package/${o.package.name}`,
+  }));
+}
+
+async function searchPubDev(query, limit) {
+  const url = `https://pub.dev/api/search?q=${encodeURIComponent(query)}`;
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`pub.dev a répondu ${r.status}`);
+  const data = await r.json();
+  const packages = (data.packages || []).slice(0, limit);
+  // Un second appel par paquet pour avoir la version courante — limité aux
+  // premiers résultats seulement pour ne pas multiplier les requêtes réseau.
+  const detailed = await Promise.all(packages.map(async (p) => {
+    try {
+      const dr = await fetch(`https://pub.dev/api/packages/${encodeURIComponent(p.package)}`);
+      if (!dr.ok) throw new Error('détail indisponible');
+      const dd = await dr.json();
+      const version = dd.latest && dd.latest.version;
+      return {
+        source: 'pub',
+        id: p.package,
+        label: `${p.package}: ^${version || '?'}`,
+        version: version || null,
+        description: (dd.latest && dd.latest.pubspec && dd.latest.pubspec.description) || '',
+        url: `https://pub.dev/packages/${p.package}`,
+        pubspecLine: version ? `${p.package}: ^${version}` : null,
+      };
+    } catch (e) {
+      return { source: 'pub', id: p.package, label: p.package, version: null, description: '', url: `https://pub.dev/packages/${p.package}` };
+    }
+  }));
+  return detailed;
+}
+
+async function searchFDroid(query, limit) {
+  const url = `https://search.f-droid.org/api/search_apps?q=${encodeURIComponent(query)}`;
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`F-Droid a répondu ${r.status}`);
+  const data = await r.json();
+  const results = (data.hits || data.results || []).slice(0, limit);
+  return results.map((h) => {
+    const src = h._source || h;
+    return {
+      source: 'fdroid',
+      id: src.packageName || src.name,
+      label: src.name || src.packageName,
+      version: src.suggestedVersionName || null,
+      description: (src.summary || '').slice(0, 200),
+      url: `https://f-droid.org/packages/${src.packageName || ''}`,
+      // Rappel légal : app F-Droid = code tiers sous SA PROPRE licence
+      // (souvent copyleft GPL/AGPL) — à utiliser comme RÉFÉRENCE/inspiration
+      // de fonctionnalité, jamais copié tel quel dans un APK client sans
+      // vérifier la compatibilité de licence.
+      licenseNote: 'Vérifier la licence du projet avant toute réutilisation de code.',
+    };
+  });
+}
+
+ipcMain.handle('search-public-library', async (event, args) => {
+  const { source, query } = args || {};
+  const limit = Math.min(Math.max(parseInt((args && args.limit) || 8, 10) || 8, 1), 20);
+  if (!query || !String(query).trim()) return { ok: false, error: 'Requête de recherche vide.' };
+  try {
+    let results;
+    if (source === 'maven') results = await searchMavenCentral(query, limit);
+    else if (source === 'npm') results = await searchNpmRegistry(query, limit);
+    else if (source === 'pub') results = await searchPubDev(query, limit);
+    else if (source === 'fdroid') results = await searchFDroid(query, limit);
+    else return { ok: false, error: `Source inconnue : '${source}'. Utilise 'maven', 'npm', 'pub' ou 'fdroid'.` };
+    return { ok: true, source, query, results };
   } catch (err) {
     return { ok: false, error: err.message };
   }
